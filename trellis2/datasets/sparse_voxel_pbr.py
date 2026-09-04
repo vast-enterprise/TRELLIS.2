@@ -16,23 +16,6 @@ from ..representations.mesh import MeshWithPbrMaterial, TextureFilterMode, Textu
 from ..utils.data_utils import load_balanced_group_indices
 
 
-def is_power_of_two(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
-
-def nearest_power_of_two(n: int) -> int:
-    if n < 1:
-        raise ValueError("n must be >= 1")
-    if is_power_of_two(n):
-        return n
-    lower = 2 ** (n.bit_length() - 1)
-    upper = 2 ** n.bit_length()
-    if n - lower < upper - n:
-        return lower
-    else:
-        return upper
-    
-
 class SparseVoxelPbrVisMixin:
     @torch.no_grad()
     def visualize_sample(self, x: Union[sp.SparseTensor, dict]):
@@ -157,13 +140,16 @@ class SparseVoxelPbrDataset(SparseVoxelPbrVisMixin, StandardDatasetBase):
         return metadata, stats
 
     @staticmethod
-    def _texture_from_dump(pack) -> Texture:
+    def _texture_from_dump(pack, channels=None) -> Texture:
         png_bytes = pack['image']
+        # Preserve the source dimensions. O-Voxel builds mipmaps directly
+        # from the original texture; resizing here changes filtering and can
+        # introduce UV-seam bleeding.
         image = Image.open(io.BytesIO(png_bytes))
-        if image.width != image.height or not is_power_of_two(image.width):
-            size = nearest_power_of_two(max(image.width, image.height))
-            image = image.resize((size, size), Image.LANCZOS)
-        texture = torch.tensor(np.array(image) / 255.0, dtype=torch.float32).reshape(image.height, image.width, -1)
+        image_array = np.array(image) / 255.0
+        if channels is not None:
+            image_array = image_array[..., channels]
+        texture = torch.tensor(image_array, dtype=torch.float32).reshape(image.height, image.width, -1)
         filter_mode = {
             'Linear': TextureFilterMode.LINEAR,
             'Closest': TextureFilterMode.CLOSEST,
@@ -191,7 +177,11 @@ class SparseVoxelPbrDataset(SparseVoxelPbrVisMixin, StandardDatasetBase):
         materials = []
         for mat in dump['materials']:
             materials.append(PbrMaterial(
-                base_color_texture=self._texture_from_dump(mat['baseColorTexture']) if mat['baseColorTexture'] is not None else None,
+                # Base color textures may carry an alpha channel in newer
+                # dumps (needed by voxel premultiplication); the mesh
+                # renderer consumes RGB here while alpha is sampled through
+                # the dedicated alpha texture below.
+                base_color_texture=self._texture_from_dump(mat['baseColorTexture'], channels=[0, 1, 2]) if mat['baseColorTexture'] is not None else None,
                 base_color_factor=mat['baseColorFactor'],
                 metallic_texture=self._texture_from_dump(mat['metallicTexture']) if mat['metallicTexture'] is not None else None,
                 metallic_factor=mat['metallicFactor'],

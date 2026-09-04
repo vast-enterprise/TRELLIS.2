@@ -52,6 +52,10 @@ def _pbr_voxelize(file, metadatum, pbr_dump_root, root):
                         "alphaTexture": None,
                         "metallicTexture": None,
                         "roughnessTexture": None,
+                        "emissiveFactor": [0.0, 0.0, 0.0],
+                        "emissiveTexture": None,
+                        "emissionStrength": 0.0,
+                        "shaderType": "Principled",
                     })      # append default material
                     dump['objects'] = [
                         obj for obj in dump['objects']
@@ -70,7 +74,9 @@ def _pbr_voxelize(file, metadatum, pbr_dump_root, root):
                         assert np.all(obj['vertices'] >= -0.5) and np.all(obj['vertices'] <= 0.5), 'vertices out of range'
 
                 coord, attr = o_voxel.convert.blender_dump_to_volumetric_attr(dump, grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                                                                              mip_level_offset=0, verbose=False, timing=False)
+                                                                              mip_level_offset=0, verbose=False, timing=False,
+                                                                              add_emission=opt.add_emission,
+                                                                              color_space=opt.color_space)
                 del attr['normal']
                 del attr['emissive']
                 o_voxel.io.write_vxz(os.path.join(root, f'pbr_voxels_{res}', f'{sha256}.vxz'), coord, attr)
@@ -99,6 +105,14 @@ if __name__ == '__main__':
                         help='Instances to process')
     dataset_utils.add_args(parser)
     parser.add_argument('--resolution', type=str, default=1024)
+    parser.add_argument('--color_space', choices=['linear', 'srgb', 'agx'], default='agx',
+                        help='Color encoding written into the base_color voxel attribute')
+    emission_group = parser.add_mutually_exclusive_group()
+    emission_group.add_argument('--add_emission', dest='add_emission', action='store_true',
+                                help='Add Principled emission to base color before color-space conversion')
+    emission_group.add_argument('--no-add-emission', dest='add_emission', action='store_false',
+                                help='Do not add emission to base color')
+    parser.set_defaults(add_emission=True)
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--max_workers', type=int, default=0)

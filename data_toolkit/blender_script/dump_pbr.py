@@ -1,4 +1,4 @@
-import argparse, sys, os, math, io
+import argparse, sys, os, math, io, tempfile
 from typing import *
 import bpy
 import bmesh
@@ -177,14 +177,34 @@ def normalize_scene() -> Tuple[float, Vector]:
 # =============== NODE TREE PARSING ===============
 
 def extract_image(tex_node, channels):
-        image = tex_node.image
-        pixels = np.array(image.pixels[:])
-        data = pixels.reshape(image.size[1], image.size[0], -1)
-        data = data[..., channels]
+        """Extract a texture through Blender's image encoder.
 
-        if data.dtype != np.uint8:
-            data = np.clip(data, 0.0, 1.0)
-            data = (data * 255).astype(np.uint8)
+        Reading ``Image.pixels`` bypasses Blender's image/color-management
+        handling (and is especially wrong for packed/generated images).  Save
+        as PNG first, then read the encoded bytes just like Blender's render
+        path does.  PNG is intentionally kept 8-bit because the on-disk PBR
+        dump format and O-Voxel sampler use byte textures.
+        """
+        image = tex_node.image
+        fd, path = tempfile.mkstemp(suffix='.png')
+        os.close(fd)
+        old_format, old_path = image.file_format, image.filepath_raw
+        try:
+            image.file_format = 'PNG'
+            image.filepath_raw = path
+            image.save()
+            with Image.open(path) as pil_image:
+                pil_image = pil_image.convert('RGBA')
+                # Blender's in-memory rows are bottom-to-top.  Preserve that
+                # orientation after the PNG round-trip so the existing UV
+                # convention in the O-Voxel sampler remains unchanged.
+                rgba = np.array(pil_image, dtype=np.uint8)[::-1].copy()
+        finally:
+            image.file_format, image.filepath_raw = old_format, old_path
+            if os.path.exists(path):
+                os.remove(path)
+
+        data = rgba[..., channels]
 
         if len(data.shape) == 2:  # Single channel
             pil_image = Image.fromarray(data, mode='L')
@@ -203,6 +223,7 @@ def extract_image(tex_node, channels):
             'image': png_bytes,
             'interpolation': tex_node.interpolation,
             'extension': tex_node.extension,
+            'color_space': image.colorspace_settings.name,
         }
 
 
@@ -223,7 +244,9 @@ def try_extract_image(link, expected_channel='RGB'):
         assert link.from_node.type == 'TEX_IMAGE', "Material is not supported"
         assert link.from_socket.name == 'Color', "Material is not supported"
         tex_node = link.from_node
-        return extract_image(tex_node, [0, 1, 2])
+        # Keep alpha in the dump for correct premultiplied filtering. Callers
+        # that need RGB only explicitly select channels when loading.
+        return extract_image(tex_node, [0, 1, 2, 3])
 
     if expected_channel in ['R', 'G', 'B']:
         socket_name = {
@@ -334,16 +357,60 @@ def main(arg):
             "alphaTexture": None,
             "metallicTexture": None,
             "roughnessTexture": None,
+            "emissiveFactor": [0.0, 0.0, 0.0],
+            "emissiveTexture": None,
+            "emissionStrength": 0.0,
+            "shaderType": "Principled",
         }
 
         try:
             principled_node = mat.node_tree.nodes.get('Principled BSDF')
-            assert principled_node is not None, "Material is not supported"
+            if principled_node is None:
+                principled_node = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            emission_node = mat.node_tree.nodes.get('Emission')
+            if emission_node is None:
+                emission_node = next((n for n in mat.node_tree.nodes if n.type == 'EMISSION'), None)
+            if principled_node is None and emission_node is None:
+                raise RuntimeError("Material is not supported: no Principled or Emission shader")
+
+            # Unshaded materials are represented as a pure emission shader.
+            if principled_node is None:
+                pack["shaderType"] = "Emission"
+                pack["metallicFactor"] = 0.0
+                pack["roughnessFactor"] = 1.0
+                has_transparent_shader = any(n.type == 'BSDF_TRANSPARENT' for n in mat.node_tree.nodes)
+                if has_transparent_shader:
+                    pack["alphaMode"] = "BLEND"
+                if emission_node.inputs['Color'].is_linked:
+                    link = emission_node.inputs['Color'].links[0]
+                    if link.from_node.type == 'RGB':
+                        pack['baseColorFactor'] = list(link.from_node.outputs[0].default_value)
+                    else:
+                        factor, image = try_extract_image_with_factor(link, 'RGB')
+                        pack['baseColorFactor'] = factor
+                        pack['baseColorTexture'] = image
+                else:
+                    pack['baseColorFactor'] = list(emission_node.inputs['Color'].default_value)
+                pack['emissionStrength'] = float(emission_node.inputs['Strength'].default_value)
+                # For a constant emission color bake strength into the
+                # factor.  Texture-backed emission is scaled when loaded so
+                # filtering happens on the original texels first.
+                if pack['baseColorTexture'] is None:
+                    pack['baseColorFactor'] = [float(v) * pack['emissionStrength'] for v in pack['baseColorFactor'][:3]] + [pack['baseColorFactor'][3] if len(pack['baseColorFactor']) > 3 else 1.0]
+                elif has_transparent_shader:
+                    # glTF unshaded alpha commonly arrives as an Emission +
+                    # Transparent node graph.  The RGB dump retains alpha,
+                    # so reuse it as the material alpha source.
+                    pack['alphaTexture'] = pack['baseColorTexture']
+                # The emission shader's color is already the final material
+                # color; do not add it a second time in the voxelizer.
+                pack['emissiveFactor'] = [0.0, 0.0, 0.0]
+                principled_node = None
 
             # Handle base color
-            if not principled_node.inputs['Base Color'].is_linked:
+            if principled_node is not None and not principled_node.inputs['Base Color'].is_linked:
                 pack["baseColorFactor"] = list(principled_node.inputs['Base Color'].default_value)
-            else:
+            elif principled_node is not None:
                 link = principled_node.inputs['Base Color'].links[0]
                 if link.from_node.type == 'RGB':
                     pack["baseColorFactor"] = list(link.from_node.outputs[0].default_value)
@@ -352,8 +419,34 @@ def main(arg):
                     pack["baseColorFactor"] = factor
                     pack["baseColorTexture"] = image
 
-            # Handle alpha
-            if not principled_node.inputs['Alpha'].is_linked:
+            # Handle emission on Principled BSDF.  Blender 4.x exposes
+            # ``Emission Color`` and ``Emission Strength``; older files may
+            # still use ``Emission``.
+            if principled_node is not None:
+                emission_color_socket = principled_node.inputs.get('Emission Color')
+                if emission_color_socket is None:
+                    emission_color_socket = principled_node.inputs.get('Emission')
+                strength_socket = principled_node.inputs.get('Emission Strength')
+                if emission_color_socket is not None:
+                    if emission_color_socket.is_linked:
+                        link = emission_color_socket.links[0]
+                        if link.from_node.type == 'RGB':
+                            pack['emissiveFactor'] = list(link.from_node.outputs[0].default_value)[:3]
+                        else:
+                            factor, image = try_extract_image_with_factor(link, 'RGB')
+                            pack['emissiveFactor'] = factor
+                            pack['emissiveTexture'] = image
+                    else:
+                        pack['emissiveFactor'] = list(emission_color_socket.default_value)[:3]
+                if strength_socket is not None:
+                    pack['emissionStrength'] = float(strength_socket.default_value)
+
+            # Handle alpha.  Pure emission materials are opaque unless a
+            # transparent shader is explicitly used (their alpha is not
+            # represented by a Principled socket).
+            if principled_node is None:
+                pack["alphaFactor"] = 1.0
+            elif not principled_node.inputs['Alpha'].is_linked:
                 pack["alphaFactor"] = principled_node.inputs['Alpha'].default_value
                 if pack["alphaFactor"] < 1.0:
                     pack["alphaMode"] = "BLEND"
@@ -385,8 +478,11 @@ def main(arg):
                     pack["alphaFactor"] = factor
                     pack["alphaTexture"] = image
 
-            # Handle metallic
-            if not principled_node.inputs['Metallic'].is_linked:
+            # Handle metallic/roughness (fixed defaults for unshaded).
+            if principled_node is None:
+                pack["metallicFactor"] = 0.0
+                pack["roughnessFactor"] = 1.0
+            elif not principled_node.inputs['Metallic'].is_linked:
                 pack["metallicFactor"] = principled_node.inputs['Metallic'].default_value
             else:
                 link = principled_node.inputs['Metallic'].links[0]
@@ -399,9 +495,9 @@ def main(arg):
                     pack["metallicTexture"] = image
 
             # Handle roughness
-            if not principled_node.inputs['Roughness'].is_linked:
+            if principled_node is not None and not principled_node.inputs['Roughness'].is_linked:
                 pack["roughnessFactor"] = principled_node.inputs['Roughness'].default_value
-            else:
+            elif principled_node is not None:
                 link = principled_node.inputs['Roughness'].links[0]
                 node = link.from_node
                 if node.type == 'VALUE':
@@ -482,4 +578,3 @@ if __name__ == '__main__':
     args = parser.parse_args(argv)
 
     main(args)
-    

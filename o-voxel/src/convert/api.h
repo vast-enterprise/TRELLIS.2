@@ -49,7 +49,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mesh_to_flexible_dual_gr
  * @param uvs                           [N_tri, 3, 2] tensor containing the texture coordinates
  * @param materialIds                   [N_tri] tensor containing the material ids
  * @param baseColorFactor               list of [3] tensor containing the base color factor
- * @param baseColorTexture              list of [H, W, 3] tensor containing the base color texture
+ * @param baseColorTexture              list of [H, W, 3] float tensor containing normalized linear base color texture
  * @param baseColorTextureFilter        list of int indicating the base color texture filter (0: NEAREST, 1: LINEAR)
  * @param baseColorTextureWrap          list of int indicating the base color texture wrap (0: REPEAT, 1: CLAMP_TO_EDGE, 2: MIRRORED_REPEAT)
  * @param metallicFactor                list of float containing the metallic factor
@@ -74,6 +74,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mesh_to_flexible_dual_gr
  * @param normalTextureFilter           list of int indicating the normal texture filter (0: NEAREST, 1: LINEAR)
  * @param normalTextureWrap             list of int indicating the normal texture wrap (0: REPEAT, 1: CLAMP_TO_EDGE, 2: MIRRORED_REPEAT)
  * @param mipLevelOffset                float indicating the mip level offset for texture mipmap
+ * @param addEmission                   whether Principled emission is added to base color
  * 
  * @return tuple containing:
  *   - coords: tensor of shape [N, 3] containing the voxel coordinates
@@ -118,5 +119,6 @@ textured_mesh_to_volumetric_attr_cpu(
     const std::vector<int>& normalTextureFilter,
     const std::vector<int>& normalTextureWrap,
     const float mipLevelOffset,
-    const bool timing
+    const bool timing,
+    const bool addEmission
 );

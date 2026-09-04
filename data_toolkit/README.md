@@ -106,6 +106,42 @@ python data_toolkit/dual_grid.py ObjaverseXL --root datasets/ObjaverseXL_sketchf
 python data_toolkit/voxelize_pbr.py ObjaverseXL --root datasets/ObjaverseXL_sketchfab --resolution 256,512,1024
 ```
 
+`voxelize_pbr.py` writes the final material color to the existing
+`base_color` voxel attribute.  For Blender-aligned colors the defaults are
+AgX output and emission enabled; these can be selected explicitly or changed:
+
+```bash
+python data_toolkit/voxelize_pbr.py ObjaverseXL \
+  --root datasets/ObjaverseXL_sketchfab --resolution 1024 \
+  --color_space agx --add_emission
+```
+
+Supported `--color_space` values are `linear`, `srgb` (IEC sRGB OETF), and
+`agx` (Blender AgX Base sRGB).  Use `--no-add-emission` to store only the
+non-emissive base color.
+
+For a standalone GLB smoke test (including Blender dumping, VXZ round-trip,
+and PLY visualization exports), run:
+
+```bash
+PYTHONPATH=o-voxel:. python tests/test_glb_to_vxz.py \
+  --glb path/to/model.glb --output-dir /tmp/trellis2_glb_test \
+  --blender blender --resolution 64 --color-space agx
+```
+
+The script writes `<model>.vxz`, coordinate-only `<model>_voxel.ply`, and
+colored `<model>.ply` / `<model>_color.ply` files with standard uint8 `red`,
+`green`, and `blue` fields. The
+repository-local `ocioutils/` directory contains the exact OCIO conversion
+module, configuration, and LUTs used for AgX (`ocioutils/color_conversion.py`,
+`ocioutils/config.ocio`, `ocioutils/luts/`, and `ocioutils/filmic/`); no approximation is used when
+`--color-space agx` is selected.
+
+To configure a fresh Debian/Ubuntu CUDA Pod and build the extension, run
+`bash set_ovoxel.sh` from the repository root. Use `SKIP_APT=1` when the
+system packages are already installed, or `SKIP_BUILD=1` to only validate the
+runtime dependencies.
+
 
 ### At this point, the dataset is ready for SC-VAE Training
 

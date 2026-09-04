@@ -5,6 +5,13 @@ import os
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
+# The source tree normally vendors Eigen as a git submodule.  CI/task pods
+# sometimes receive a source export without submodule contents, in which case
+# use the standard system installation supplied by libeigen3-dev.
+VENDORED_EIGEN = os.path.join(ROOT, "third_party", "eigen")
+EIGEN_INCLUDE = VENDORED_EIGEN if os.path.isfile(os.path.join(VENDORED_EIGEN, "Eigen", "Dense")) \
+    else "/usr/include/eigen3"
+
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_HIP = True
@@ -53,7 +60,7 @@ setup(
                 "src/ext.cpp",
             ],
             include_dirs=[
-                os.path.join(ROOT, "third_party/eigen"),
+                EIGEN_INCLUDE,
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],

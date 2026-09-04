@@ -1,5 +1,7 @@
 from typing import *
 import io
+import importlib.util
+from pathlib import Path
 from PIL import Image
 import torch
 import numpy as np
@@ -22,21 +24,9 @@ ALPHA_MODE_ENUM = {
 }
 
 
-def is_power_of_two(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
-
-def nearest_power_of_two(n: int) -> int:
-    if n < 1:
-        raise ValueError("n must be >= 1")
-    if is_power_of_two(n):
-        return n
-    lower = 2 ** (n.bit_length() - 1)
-    upper = 2 ** n.bit_length()
-    if n - lower < upper - n:
-        return lower
-    else:
-        return upper
+def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
+    """Decode an IEC sRGB image into Blender shader linear RGB."""
+    return np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
 
 
 def textured_mesh_to_volumetric_attr(
@@ -208,24 +198,24 @@ def textured_mesh_to_volumetric_attr(
                 else torch.zeros(g.triangles.shape[0], 3, 2, dtype=torch.float32)                                                                        # [N, 3, 2]
         baseColorFactor = torch.tensor(g.visual.material.baseColorFactor / 255, dtype=torch.float32) if g.visual.material.baseColorFactor is not None \
                           else torch.ones(3, dtype=torch.float32)                                                                                        # [3]
-        baseColorTexture = torch.tensor(np.array(g.visual.material.baseColorTexture.convert('RGBA'))[..., :3], dtype=torch.uint8) if g.visual.material.baseColorTexture is not None \
+        baseColorTexture = torch.tensor(np.array(g.visual.material.baseColorTexture.convert('RGBA'))[..., :3], dtype=torch.float32) / 255.0 if g.visual.material.baseColorTexture is not None \
                            else torch.tensor([])                                                                                                                # [H, W, 3]
         metallicFactor = g.visual.material.metallicFactor if g.visual.material.metallicFactor is not None else 1.0
-        metallicTexture = torch.tensor(np.array(g.visual.material.metallicRoughnessTexture.convert('RGB'))[..., 2], dtype=torch.uint8) if g.visual.material.metallicRoughnessTexture is not None \
+        metallicTexture = torch.tensor(np.array(g.visual.material.metallicRoughnessTexture.convert('RGB'))[..., 2], dtype=torch.float32) / 255.0 if g.visual.material.metallicRoughnessTexture is not None \
                           else torch.tensor([])                                                                                                                 # [H, W]
         roughnessFactor = g.visual.material.roughnessFactor if g.visual.material.roughnessFactor is not None else 1.0
-        roughnessTexture = torch.tensor(np.array(g.visual.material.metallicRoughnessTexture.convert('RGB'))[..., 1], dtype=torch.uint8) if g.visual.material.metallicRoughnessTexture is not None \
+        roughnessTexture = torch.tensor(np.array(g.visual.material.metallicRoughnessTexture.convert('RGB'))[..., 1], dtype=torch.float32) / 255.0 if g.visual.material.metallicRoughnessTexture is not None \
                            else torch.tensor([])                                                                                                                # [H, W]
         emissiveFactor = torch.tensor(g.visual.material.emissiveFactor, dtype=torch.float32) if g.visual.material.emissiveFactor is not None \
                          else torch.zeros(3, dtype=torch.float32)                                                                                        # [3]
-        emissiveTexture = torch.tensor(np.array(g.visual.material.emissiveTexture.convert('RGB'))[..., :3], dtype=torch.uint8) if g.visual.material.emissiveTexture is not None \
+        emissiveTexture = torch.tensor(np.array(g.visual.material.emissiveTexture.convert('RGB'))[..., :3], dtype=torch.float32) / 255.0 if g.visual.material.emissiveTexture is not None \
                           else torch.tensor([])                                                                                                                 # [H, W, 3]
         alphaMode = ALPHA_MODE_ENUM[g.visual.material.alphaMode] if g.visual.material.alphaMode in ALPHA_MODE_ENUM else 0
         alphaCutoff = g.visual.material.alphaCutoff if g.visual.material.alphaCutoff is not None else 0.5
         alphaFactor = g.visual.material.baseColorFactor[3] / 255 if g.visual.material.baseColorFactor is not None else 1.0
-        alphaTexture = torch.tensor(np.array(g.visual.material.baseColorTexture.convert('RGBA'))[..., 3], dtype=torch.uint8) if g.visual.material.baseColorTexture is not None and alphaMode != 0 \
+        alphaTexture = torch.tensor(np.array(g.visual.material.baseColorTexture.convert('RGBA'))[..., 3], dtype=torch.float32) / 255.0 if g.visual.material.baseColorTexture is not None and alphaMode != 0 \
                        else torch.tensor([])                                                                                                                    # [H, W]
-        normalTexture = torch.tensor(np.array(g.visual.material.normalTexture.convert('RGB'))[..., :3], dtype=torch.uint8) if g.visual.material.normalTexture is not None \
+        normalTexture = torch.tensor(np.array(g.visual.material.normalTexture.convert('RGB'))[..., :3], dtype=torch.float32) / 255.0 if g.visual.material.normalTexture is not None \
                         else torch.tensor([])                                                                                                                   # [H, W, 3]
         
         scene_buffers['triangles'].append(triangles)
@@ -286,6 +276,7 @@ def textured_mesh_to_volumetric_attr(
         [0] * len(scene_buffers["normal_texture"]),
         mip_level_offset,
         timing,
+        False,
     )
     
     # Post process
@@ -310,6 +301,8 @@ def blender_dump_to_volumetric_attr(
     mip_level_offset: float = 0.0,
     verbose: bool = False,
     timing: bool = False,
+    add_emission: bool = True,
+    color_space: str = 'agx',
 ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Voxelize a mesh into a sparse voxel grid with PBR properties.
@@ -335,6 +328,8 @@ def blender_dump_to_volumetric_attr(
         - "alpha": The alpha value of the occupied voxels.
         - "normal": The normal of the occupied voxels.
     """        
+    if color_space not in ('linear', 'srgb', 'agx'):
+        raise ValueError("color_space must be one of: linear, srgb, agx")
     # Voxelize settings
     assert voxel_size is not None or grid_size is not None, "Either voxel_size or grid_size must be provided"
 
@@ -425,6 +420,10 @@ def blender_dump_to_volumetric_attr(
         'roughness_texture': [],
         'roughness_texture_filter': [],
         'roughness_texture_wrap': [],
+        'emissive_factor': [],
+        'emissive_texture': [],
+        'emissive_texture_filter': [],
+        'emissive_texture_wrap': [],
         'alpha_mode': [],
         'alpha_cutoff': [],
         'alpha_factor': [],
@@ -433,13 +432,43 @@ def blender_dump_to_volumetric_attr(
         'alpha_texture_wrap': [],
     }
 
-    def load_texture(pack):
+    def load_texture(pack, channels=None, premultiply_alpha=False, decode_srgb=False):
         png_bytes = pack['image']
-        image = Image.open(io.BytesIO(png_bytes))
-        if image.width != image.height or not is_power_of_two(image.width):
-            size = nearest_power_of_two(max(image.width, image.height))
-            image = image.resize((size, size), Image.LANCZOS)
-        texture = torch.tensor(np.array(image), dtype=torch.uint8)
+        with Image.open(io.BytesIO(png_bytes)) as image:
+            # ``dump_pbr.py`` encodes scalar sockets (roughness, metallic and
+            # alpha) as L PNGs.  Converting L to RGBA makes the requested
+            # alpha channel opaque (255), so retain the scalar plane in that
+            # case.  RGB/RGBA material images still use the full RGBA path.
+            is_scalar_png = image.mode in ('1', 'L', 'I', 'I;16', 'F')
+            if is_scalar_png:
+                scalar_arr = np.array(image.convert('L'), dtype=np.float32) / 255.0
+            rgba_arr = np.array(image.convert('RGBA'), dtype=np.float32) / 255.0
+        source_color_space = pack.get('color_space', 'sRGB')
+        if is_scalar_png:
+            if premultiply_alpha or decode_srgb or channels is None or not isinstance(channels, int):
+                raise ValueError("Scalar PNG can only be loaded as one unencoded channel")
+            # The integer is a logical source-channel selector (R/G/B/A)
+            # retained by the caller; after ``extract_image`` the PNG itself
+            # is already a single L plane, so any integer selector maps to it.
+            arr = scalar_arr
+        else:
+            arr = rgba_arr
+            if decode_srgb:
+                if source_color_space == 'sRGB':
+                    # Decode before filtering and retain float32 precision
+                    # through mip generation. This avoids the former raw-sRGB
+                    # sampling error and an unnecessary linear->8-bit->linear
+                    # round trip.
+                    arr[..., :3] = _srgb_to_linear(arr[..., :3])
+                elif source_color_space != 'Non-Color':
+                    raise ValueError(
+                        f"Color texture must use Blender sRGB or Non-Color data, got {source_color_space!r}"
+                    )
+            if premultiply_alpha:
+                arr[..., :3] *= arr[..., 3:4]
+            if channels is not None:
+                arr = arr[..., channels]
+        texture = torch.tensor(arr, dtype=torch.float32)
         filter_mode = {
             'Linear': 1,
             'Closest': 0,
@@ -456,14 +485,23 @@ def blender_dump_to_volumetric_attr(
 
     for material in dump['materials']:
         baseColorFactor = torch.tensor(material['baseColorFactor'][:3], dtype=torch.float32)
+        is_emission_shader = material.get('shaderType') == 'Emission'
         if material['baseColorTexture'] is not None:
             baseColorTexture, baseColorTextureFilter, baseColorTextureWrap = \
-                load_texture(material['baseColorTexture'])
+                load_texture(material['baseColorTexture'], channels=[0, 1, 2],
+                             premultiply_alpha=not is_emission_shader, decode_srgb=True)
             assert baseColorTexture.shape[2] == 3, f"Base color texture must have 3 channels, but got {baseColorTexture.shape[2]}"
         else:
             baseColorTexture = torch.tensor([])
             baseColorTextureFilter = 0
             baseColorTextureWrap = 0
+        if is_emission_shader and baseColorTexture.numel() > 0:
+            # A pure Emission shader has no separate emission channel in the
+            # dump. Apply Strength to its base-color texture without applying
+            # it a second time in the C++ add-emission path.  Do not clamp:
+            # Emission Strength can produce HDR values which AgX must receive
+            # before final output quantization.
+            baseColorTexture = baseColorTexture * float(material.get('emissionStrength', 1.0))
         scene_buffers['base_color_factor'].append(baseColorFactor)
         scene_buffers['base_color_texture'].append(baseColorTexture)
         scene_buffers['base_color_texture_filter'].append(baseColorTextureFilter)
@@ -472,7 +510,7 @@ def blender_dump_to_volumetric_attr(
         metallicFactor = material['metallicFactor']
         if material['metallicTexture'] is not None:
             metallicTexture, metallicTextureFilter, metallicTextureWrap = \
-                load_texture(material['metallicTexture'])
+                load_texture(material['metallicTexture'], channels=2)
             assert metallicTexture.dim() == 2, f"Metallic roughness texture must have 2 dimensions, but got {metallicTexture.dim()}"
         else:
             metallicTexture = torch.tensor([])
@@ -486,7 +524,7 @@ def blender_dump_to_volumetric_attr(
         roughnessFactor = material['roughnessFactor']
         if material['roughnessTexture'] is not None:
             roughnessTexture, roughnessTextureFilter, roughnessTextureWrap = \
-                load_texture(material['roughnessTexture'])
+                load_texture(material['roughnessTexture'], channels=1)
             assert roughnessTexture.dim() == 2, f"Metallic roughness texture must have 2 dimensions, but got {roughnessTexture.dim()}"
         else:
             roughnessTexture = torch.tensor([])
@@ -497,12 +535,30 @@ def blender_dump_to_volumetric_attr(
         scene_buffers['roughness_texture_filter'].append(roughnessTextureFilter)
         scene_buffers['roughness_texture_wrap'].append(roughnessTextureWrap)
 
+        emissiveFactor = torch.tensor(material.get('emissiveFactor', [0.0, 0.0, 0.0])[:3], dtype=torch.float32)
+        if material.get('emissiveTexture') is not None:
+            emissiveTexture, emissiveTextureFilter, emissiveTextureWrap = \
+                load_texture(material['emissiveTexture'], channels=[0, 1, 2], premultiply_alpha=False, decode_srgb=True)
+        else:
+            emissiveTexture = torch.tensor([])
+            emissiveTextureFilter = 0
+            emissiveTextureWrap = 0
+        strength = float(material.get('emissionStrength', 1.0))
+        emissiveFactor = emissiveFactor * strength
+        if is_emission_shader:
+            emissiveFactor = torch.zeros(3, dtype=torch.float32)
+            emissiveTexture = torch.tensor([])
+        scene_buffers['emissive_factor'].append(emissiveFactor)
+        scene_buffers['emissive_texture'].append(emissiveTexture)
+        scene_buffers['emissive_texture_filter'].append(emissiveTextureFilter)
+        scene_buffers['emissive_texture_wrap'].append(emissiveTextureWrap)
+
         alphaMode = ALPHA_MODE_ENUM[material['alphaMode']]
         alphaCutoff = material['alphaCutoff']
         alphaFactor = material['alphaFactor']
         if material['alphaTexture'] is not None:
             alphaTexture, alphaTextureFilter, alphaTextureWrap = \
-                load_texture(material['alphaTexture'])
+                load_texture(material['alphaTexture'], channels=3)
             assert alphaTexture.dim() == 2, f"Alpha texture must have 2 dimensions, but got {alphaTexture.dim()}"
         else:
             alphaTexture = torch.tensor([])
@@ -531,6 +587,24 @@ def blender_dump_to_volumetric_attr(
     scene_buffers['material_ids'] = torch.cat(scene_buffers['material_ids'], dim=0)  # [N]
 
     scene_buffers['uvs'][:, :, 1] = 1 - scene_buffers['uvs'][:, :, 1]  # Flip v coordinate
+
+    # Validate all data before entering the native implementation.  Invalid
+    # geometry/material indices otherwise become unchecked pointer arithmetic
+    # in C++ and can terminate the process with SIGSEGV instead of a useful
+    # Python exception.
+    for name in ('triangles', 'normals', 'uvs'):
+        value = scene_buffers[name]
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} contains NaN or infinite values")
+    if scene_buffers['material_ids'].numel():
+        mids = scene_buffers['material_ids']
+        if int(mids.min()) < 0 or int(mids.max()) >= len(dump['materials']):
+            raise ValueError(
+                f"material_ids out of range [0, {len(dump['materials'])}): "
+                f"min={int(mids.min())}, max={int(mids.max())}"
+            )
+    if scene_buffers['triangles'].shape[0] == 0:
+        raise ValueError("Dump contains no triangles")
             
     # Voxelize
     out_tuple = _C.textured_mesh_to_volumetric_attr_cpu(
@@ -552,10 +626,10 @@ def blender_dump_to_volumetric_attr(
         scene_buffers["roughness_texture"],
         scene_buffers["roughness_texture_filter"],
         scene_buffers["roughness_texture_wrap"],
-        [torch.zeros(3, dtype=torch.float32) for _ in range(len(scene_buffers["base_color_texture"]))],
-        [torch.tensor([]) for _ in range(len(scene_buffers["base_color_texture"]))],
-        [0] * len(scene_buffers["base_color_texture"]),
-        [0] * len(scene_buffers["base_color_texture"]),
+        scene_buffers["emissive_factor"],
+        scene_buffers["emissive_texture"],
+        scene_buffers["emissive_texture_filter"],
+        scene_buffers["emissive_texture_wrap"],
         scene_buffers["alpha_mode"],
         scene_buffers["alpha_cutoff"],
         scene_buffers["alpha_factor"],
@@ -567,12 +641,42 @@ def blender_dump_to_volumetric_attr(
         [0] * len(scene_buffers["base_color_texture"]),
         mip_level_offset,
         timing,
+        add_emission,
     )
     
     # Post process
     coord = out_tuple[0]
+    base_color = out_tuple[1].reshape(-1, 3)
+    if color_space == 'srgb':
+        nonnegative = torch.clamp(base_color, min=0)
+        base_color = torch.where(nonnegative <= 0.0031308, 12.92 * nonnegative,
+                                 1.055 * nonnegative.pow(1 / 2.4) - 0.055)
+    elif color_space == 'agx':
+        # Always use the exact OCIO module/config shipped with this checkout;
+        # an unrelated module with the same import name must not silently
+        # change the rendered colors.
+        ocio_root = Path(__file__).resolve().parents[3] / "ocioutils"
+        module_path = ocio_root / "color_conversion.py"
+        try:
+            if not module_path.is_file():
+                raise FileNotFoundError(module_path)
+            spec = importlib.util.spec_from_file_location("trellis2_color_conversion", module_path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load bundled color conversion module: {module_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            agx = module.agx
+        except (FileNotFoundError, ImportError) as e:
+            raise ImportError(
+                "AgX output requires the bundled ocioutils/color_conversion.py, "
+                "ocioutils/config.ocio, LUT directories, and PyOpenColorIO"
+            ) from e
+        base_color = torch.from_numpy(agx.apply(
+            base_color.detach().cpu().numpy()[None], dst_space='AgX Base sRGB'
+        )[0])
+    base_color = torch.clamp(base_color * 255, 0, 255).byte()
     attr = {
-        "base_color": torch.clamp(out_tuple[1] * 255, 0, 255).byte().reshape(-1, 3),
+        "base_color": base_color,
         "metallic": torch.clamp(out_tuple[2] * 255, 0, 255).byte().reshape(-1, 1),
         "roughness": torch.clamp(out_tuple[3] * 255, 0, 255).byte().reshape(-1, 1),
         "emissive": torch.clamp(out_tuple[4] * 255, 0, 255).byte().reshape(-1, 3),
