@@ -3,6 +3,7 @@ import torch
 from .ply import *
 from .npz import *
 from .vxz import *
+from .vxzm import *
 
 
 def read(file_path: str) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -22,6 +23,8 @@ def read(file_path: str) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         return read_ply(file_path)
     elif file_path.endswith('.vxz'):
         return read_vxz(file_path)
+    elif file_path.endswith('.vxzm'):
+        return read_vxzm(file_path)
     else:
         raise ValueError(f"Unsupported file type {file_path}")
     
@@ -41,5 +44,7 @@ def write(file_path: str, coord: torch.Tensor, attr: Dict[str, torch.Tensor], **
         write_ply(file_path, coord, attr, **kwargs)
     elif file_path.endswith('.vxz'):
         write_vxz(file_path, coord, attr, **kwargs)
+    elif file_path.endswith('.vxzm'):
+        write_vxzm(file_path, coord, attr, **kwargs)
     else:
         raise ValueError(f"Unsupported file type {file_path}")

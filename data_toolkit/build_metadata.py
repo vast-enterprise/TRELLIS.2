@@ -198,7 +198,12 @@ if __name__ == '__main__':
             f.write(f'  - Number of assets with PBR voxelization:\n')
             for res in pbr_voxel_resolutions:
                 if pbr_voxel_metadata[res] is not None:
-                    f.write(f'    - {res}: {pbr_voxel_metadata[res]["pbr_voxelized"].sum()}\n')
+                    fields = []
+                    if 'pbr_voxelized' in pbr_voxel_metadata[res]:
+                        fields.append(f'VXZ={pbr_voxel_metadata[res]["pbr_voxelized"].sum()}')
+                    if 'pbrm_voxelized' in pbr_voxel_metadata[res]:
+                        fields.append(f'VXZM={pbr_voxel_metadata[res]["pbrm_voxelized"].sum()}')
+                    f.write(f'    - {res}: {", ".join(fields)}\n')
         if len(ss_latent_models) != 0:
             f.write(f'  - Number of assets with sparse structure latents:\n')
             for model in ss_latent_models:

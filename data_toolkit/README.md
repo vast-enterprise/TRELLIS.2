@@ -120,6 +120,45 @@ Supported `--color_space` values are `linear`, `srgb` (IEC sRGB OETF), and
 `agx` (Blender AgX Base sRGB).  Use `--no-add-emission` to store only the
 non-emissive base color.
 
+Multi-surface material samples use the separate `.vxzm` format. It preserves
+multiple records at one fine voxel when their signed surface-normal angle is
+greater than 15 degrees. Existing `.vxz` output remains the default and is
+unchanged. Generate either or both formats with:
+
+VXZM requires PBR dumps produced by the current `dump_pbr.py`, which preserves
+Blender-authored corner normals in world space. Legacy dumps without the
+`surface_normal_source=blender_authored_corner_world_v1` marker are rejected;
+re-run the PBR dump stage for those GLBs. This check applies only to VXZM, so
+the existing VXZ path remains compatible with older dumps.
+
+```bash
+python data_toolkit/voxelize_pbr.py ObjaverseXL \
+  --root datasets/ObjaverseXL_sketchfab --resolution 1024 \
+  --output-format both --region-resolution 256 \
+  --cluster-angle-degrees 15 \
+  --max-records-per-voxel 0 --max-total-records 0
+```
+
+At 1024 resolution, each occupied leaf of the 256-resolution coarse SVO owns
+a 4x4x4 local block. Its record count, byte offset, local positions, colors,
+surface normals, metallic, roughness, emissive, and alpha attributes are
+stored independently. See
+`o-voxel/VXZM_FORMAT.md` for the binary layout. A standalone conversion and
+PLY visualization test is available as:
+
+```bash
+PYTHONPATH=o-voxel:. python tests/test_glb_to_vxzm.py \
+  --glb path/to/model.glb --output-dir /tmp/trellis2_vxzm_test \
+  --resolution 1024 --region-resolution 256
+```
+
+For training-side experimentation, `MultiSurfaceVoxelPbrDataset` reads VXZM
+as ordinary `coord`/`feats` tensors plus sample and region offsets. It does not
+construct the existing sparse-convolution tensor, because duplicate
+coordinates would otherwise be coalesced and lose their normal clusters.
+VXZM cache metadata includes the complete record layout, so schema changes
+such as adding a PBR field automatically invalidate and regenerate old files.
+
 For a standalone GLB smoke test (including Blender dumping, VXZ round-trip,
 and PLY visualization exports), run:
 

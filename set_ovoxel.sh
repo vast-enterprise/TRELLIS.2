@@ -91,3 +91,4 @@ PY
 
 echo "Environment ready. Example:"
 echo "  PYTHONPATH=o-voxel:. python tests/test_glb_to_vxz.py --glb testmesh/<model>.glb --output-dir /tmp/trellis2_glb_test --blender blender --resolution 64 --color-space agx"
+echo "  PYTHONPATH=o-voxel:. python tests/test_glb_to_vxzm.py --glb testmesh/<model>.glb --output-dir /tmp/trellis2_vxzm_test --blender blender --resolution 1024 --region-resolution 256 --color-space agx"

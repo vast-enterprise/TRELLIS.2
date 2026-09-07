@@ -1,8 +1,7 @@
 import argparse, sys, os, math, io, tempfile
 from typing import *
 import bpy
-import bmesh
-from mathutils import Vector, Matrix
+from mathutils import Vector
 import numpy as np
 from PIL import Image
 import pickle
@@ -340,6 +339,11 @@ def main(arg):
     output = {
         'materials': [],
         'objects': [],
+        # VXZM relies on these authored corner normals for clustering.  Keep
+        # an explicit provenance marker so old BMesh-generated dumps (whose
+        # normals may be zero or in a different frame) are never reused
+        # silently as equivalent data.
+        'surface_normal_source': 'blender_authored_corner_world_v1',
     }
 
     # Dumping materials
@@ -527,41 +531,64 @@ def main(arg):
         
         eval_obj = obj.evaluated_get(depsgraph)
         eval_mesh = eval_obj.to_mesh()
-        
-        bm = bmesh.new()
-        bm.from_mesh(eval_mesh)
-        bm.transform(obj.matrix_world)
-        bmesh.ops.triangulate(bm, faces=bm.faces)
-        bm.to_mesh(eval_mesh)
-        bm.free()
-                
-        pack["vertices"] = np.array([
-            v.co[:] for v in eval_mesh.vertices
-        ], dtype=np.float32)   # (N, 3)
-        
-        pack["faces"] = np.array([
-            [eval_mesh.loops[i].vertex_index for i in poly.loop_indices]
-            for poly in eval_mesh.polygons
-        ], dtype=np.int32)   # (F, 3)
-        
-        pack["normals"] = np.array([
-            [eval_mesh.loops[i].normal for i in poly.loop_indices]
-            for poly in eval_mesh.polygons
-        ], dtype=np.float32)  # (F, 3, 3)
-        
-        if eval_mesh.uv_layers.active is not None:
-            pack["uvs"] = np.array([
-                [eval_mesh.uv_layers.active.data[i].uv for i in poly.loop_indices]
-                for poly in eval_mesh.polygons
-            ], dtype=np.float32)  # (F, 3, 2)
+        try:
+            # ``loop_triangles`` gives a non-destructive triangulation whose
+            # loop indices still address imported custom/split normals and UVs.
+            # Converting through BMesh invalidates those authored normals and
+            # can leave all-zero loop normals until a geometric recomputation,
+            # which is not the surface-normal semantics required by VXZM.
+            eval_mesh.calc_loop_triangles()
+            eval_mesh.calc_normals_split()
+            triangles = list(eval_mesh.loop_triangles)
+            world_matrix = eval_obj.matrix_world.copy()
+            normal_matrix = world_matrix.to_3x3().inverted_safe().transposed()
 
-        pack["mat_ids"] = np.array([
-            bpy.data.materials.find(obj.material_slots[poly.material_index].name)
-            if len(obj.material_slots) > 0 and obj.material_slots[poly.material_index].material is not None else -1
-            for poly in eval_mesh.polygons
-        ], dtype=np.int32)
+            pack["vertices"] = np.array([
+                (world_matrix @ v.co)[:] for v in eval_mesh.vertices
+            ], dtype=np.float32)   # (N, 3), world space
 
-        output['objects'].append(pack)
+            pack["faces"] = np.array([
+                list(triangle.vertices) for triangle in triangles
+            ], dtype=np.int32).reshape(-1, 3)   # (F, 3)
+
+            transformed_normals = []
+            for triangle in triangles:
+                # ``corner_normals`` preserves mesh-authored split/corner
+                # normals (including smooth shading).  Transform them
+                # with the inverse-transpose so non-uniform object scale is
+                # handled correctly.  A zero/invalid authored normal remains
+                # zero and is safely replaced by the geometric face normal in
+                # the native VXZM sampler.
+                triangle_normals = []
+                for loop_index in triangle.loops:
+                    local_normal = eval_mesh.corner_normals[loop_index].vector
+                    world_normal = normal_matrix @ Vector(local_normal)
+                    if world_normal.length_squared > 1e-20:
+                        world_normal.normalize()
+                    triangle_normals.append(world_normal[:])
+                transformed_normals.append(triangle_normals)
+            pack["normals"] = np.asarray(
+                transformed_normals, dtype=np.float32
+            ).reshape(-1, 3, 3)  # (F, 3, 3), world space
+
+            if eval_mesh.uv_layers.active is not None:
+                uv_data = eval_mesh.uv_layers.active.data
+                pack["uvs"] = np.array([
+                    [uv_data[i].uv for i in triangle.loops]
+                    for triangle in triangles
+                ], dtype=np.float32).reshape(-1, 3, 2)  # (F, 3, 2)
+
+            pack["mat_ids"] = np.array([
+                bpy.data.materials.find(obj.material_slots[triangle.material_index].name)
+                if (triangle.material_index < len(obj.material_slots) and
+                    obj.material_slots[triangle.material_index].material is not None)
+                else -1
+                for triangle in triangles
+            ], dtype=np.int32)
+
+            output['objects'].append(pack)
+        finally:
+            eval_obj.to_mesh_clear()
 
     # Save output
     os.makedirs(os.path.dirname(arg.output_path), exist_ok=True)

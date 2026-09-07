@@ -13,7 +13,8 @@ from .. import _C
 
 __all__ = [
     "textured_mesh_to_volumetric_attr",
-    "blender_dump_to_volumetric_attr"
+    "blender_dump_to_volumetric_attr",
+    "blender_dump_to_volumetric_attr_multi",
 ]
 
 
@@ -22,6 +23,8 @@ ALPHA_MODE_ENUM = {
     "MASK": 1,
     "BLEND": 2,
 }
+
+BLENDER_DUMP_SURFACE_NORMAL_SOURCE = 'blender_authored_corner_world_v1'
 
 
 def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
@@ -303,6 +306,10 @@ def blender_dump_to_volumetric_attr(
     timing: bool = False,
     add_emission: bool = True,
     color_space: str = 'agx',
+    multi_surface: bool = False,
+    cluster_angle_degrees: float = 15.0,
+    max_records_per_voxel: int = 0,
+    max_total_records: int = 0,
 ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Voxelize a mesh into a sparse voxel grid with PBR properties.
@@ -330,6 +337,18 @@ def blender_dump_to_volumetric_attr(
     """        
     if color_space not in ('linear', 'srgb', 'agx'):
         raise ValueError("color_space must be one of: linear, srgb, agx")
+    if not np.isfinite(cluster_angle_degrees) or not (0.0 < cluster_angle_degrees < 180.0):
+        raise ValueError("cluster_angle_degrees must be in (0, 180)")
+    if max_records_per_voxel < 0:
+        raise ValueError("max_records_per_voxel must be non-negative")
+    if max_total_records < 0:
+        raise ValueError("max_total_records must be non-negative")
+    if (multi_surface and
+            dump.get('surface_normal_source') != BLENDER_DUMP_SURFACE_NORMAL_SOURCE):
+        raise ValueError(
+            "VXZM requires a current Blender dump with world-space authored "
+            "corner normals; regenerate the GLB dump with dump_pbr.py"
+        )
     # Voxelize settings
     assert voxel_size is not None or grid_size is not None, "Either voxel_size or grid_size must be provided"
 
@@ -570,6 +589,7 @@ def blender_dump_to_volumetric_attr(
         scene_buffers['alpha_texture'].append(alphaTexture)
         scene_buffers['alpha_texture_filter'].append(alphaTextureFilter)
         scene_buffers['alpha_texture_wrap'].append(alphaTextureWrap)
+
     
     for object in dump['objects']:
         triangles = torch.tensor(object['vertices'][object['faces']], dtype=torch.float32).reshape(-1, 3, 3) - aabb[0].reshape(1, 1, 3)
@@ -606,8 +626,11 @@ def blender_dump_to_volumetric_attr(
     if scene_buffers['triangles'].shape[0] == 0:
         raise ValueError("Dump contains no triangles")
             
-    # Voxelize
-    out_tuple = _C.textured_mesh_to_volumetric_attr_cpu(
+    # Voxelize. Multi-surface collection is a separate native entry point;
+    # the legacy VXZ entry point and its result ordering stay unchanged.
+    native_fn = (_C.textured_mesh_to_volumetric_attr_multi_cpu if multi_surface
+                 else _C.textured_mesh_to_volumetric_attr_cpu)
+    native_args = [
         voxel_size,
         grid_range,
         scene_buffers["triangles"],
@@ -636,13 +659,30 @@ def blender_dump_to_volumetric_attr(
         scene_buffers["alpha_texture"],
         scene_buffers["alpha_texture_filter"],
         scene_buffers["alpha_texture_wrap"],
-        [torch.tensor([]) for _ in range(len(scene_buffers["base_color_texture"]))],
-        [0] * len(scene_buffers["base_color_texture"]),
-        [0] * len(scene_buffers["base_color_texture"]),
-        mip_level_offset,
-        timing,
-        add_emission,
-    )
+    ]
+    if multi_surface:
+        native_args.extend([
+            mip_level_offset,
+            timing,
+            add_emission,
+            float(cluster_angle_degrees),
+            int(max_records_per_voxel),
+            int(max_total_records),
+        ])
+    else:
+        # Blender dump voxelization has never supplied a normal map for the
+        # legacy VXZ path. Keep the old native signature intact while making
+        # the separate VXZM native API surface-normal-only by construction.
+        material_count = len(scene_buffers["base_color_texture"])
+        native_args.extend([
+            [torch.tensor([]) for _ in range(material_count)],
+            [0] * material_count,
+            [0] * material_count,
+            mip_level_offset,
+            timing,
+            add_emission,
+        ])
+    out_tuple = native_fn(*native_args)
     
     # Post process
     coord = out_tuple[0]
@@ -685,3 +725,29 @@ def blender_dump_to_volumetric_attr(
     }
     
     return coord, attr
+
+
+def blender_dump_to_volumetric_attr_multi(
+    dump: Dict[str, Any],
+    *args,
+    cluster_angle_degrees: float = 15.0,
+    max_records_per_voxel: int = 0,
+    max_total_records: int = 0,
+    **kwargs,
+):
+    """Multi-surface variant returning duplicate coordinates when needed.
+
+    This is a thin, explicit wrapper around the existing Blender dump path;
+    all texture, alpha, emission, color-space, and mipmap behavior is shared
+    with VXZ.  The output is suitable for :func:`o_voxel.io.write_vxzm`.
+    """
+    if dump.get('surface_normal_source') != BLENDER_DUMP_SURFACE_NORMAL_SOURCE:
+        raise ValueError(
+            "VXZM requires a current Blender dump with world-space authored "
+            "corner normals; regenerate the GLB dump with dump_pbr.py"
+        )
+    kwargs['multi_surface'] = True
+    kwargs['cluster_angle_degrees'] = cluster_angle_degrees
+    kwargs['max_records_per_voxel'] = max_records_per_voxel
+    kwargs['max_total_records'] = max_total_records
+    return blender_dump_to_volumetric_attr(dump, *args, **kwargs)

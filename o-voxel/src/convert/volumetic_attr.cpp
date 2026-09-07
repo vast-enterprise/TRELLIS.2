@@ -4,11 +4,16 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 #include <Eigen/Dense>
 #include <ctime>
 
 #include "api.h"
 
+static thread_local bool g_multi_surface = false;
+static thread_local float g_multi_surface_cluster_angle = 15.0f;
+static thread_local int64_t g_multi_surface_max_records_per_voxel = 0;
+static thread_local int64_t g_multi_surface_max_total_records = 0;
 
 template <typename T, typename U>
 static inline U lerp(const T& a, const T& b, const T& t, const U& val_a, const U& val_b) {
@@ -36,6 +41,18 @@ struct VoxelCoord {
     bool operator==(const VoxelCoord& other) const {
         return x == other.x && y == other.y && z == other.z;
     }
+};
+
+struct MultiSurfaceSample {
+    VoxelCoord coord;
+    float weight;
+    Eigen::Vector3f baseColor;
+    float metallic;
+    float roughness;
+    Eigen::Vector3f emissive;
+    float alpha;
+    Eigen::Vector3f clusterNormal;
+    Eigen::Vector3f geometricNormal;
 };
 
 // Hash function for VoxelCoord to use in unordered_map
@@ -421,6 +438,10 @@ voxelize_trimesh_pbr_impl(
     const bool timing,
     const bool addEmission
 ) {
+    const bool multiSurface = g_multi_surface;
+    const float clusterAngleDegrees = g_multi_surface_cluster_angle;
+    const int64_t maxRecordsPerVoxel = g_multi_surface_max_records_per_voxel;
+    const int64_t maxTotalRecords = g_multi_surface_max_total_records;
     clock_t start, end;
 
     // Common variables used in the voxelization process
@@ -479,6 +500,18 @@ voxelize_trimesh_pbr_impl(
     std::vector<Eigen::Vector3f> buf_emissives;
     std::vector<float> buf_alphas;
     std::vector<Eigen::Vector3f> buf_normals;
+    // Multi-surface samples are sorted and clustered after all triangles have
+    // been sampled. This keeps cluster membership independent of mesh face
+    // order while the legacy path below retains its original behavior.
+    std::vector<MultiSurfaceSample> multi_samples;
+    // One sample is produced per triangle/voxel intersection before normal
+    // clustering. A configured total-record cap is also an upper bound on
+    // this raw vector, preventing pathological meshes from exhausting memory
+    // before the final cluster count can be checked.
+    const size_t maxMultiSamples = maxTotalRecords > 0
+        ? static_cast<size_t>(maxTotalRecords)
+        : std::numeric_limits<size_t>::max();
+    const float cluster_cosine = std::cos(clusterAngleDegrees * static_cast<float>(std::acos(-1.0)) / 180.0f);
 
     // Enumerate all triangles
     start = clock();
@@ -491,7 +524,11 @@ voxelize_trimesh_pbr_impl(
         Eigen::Vector3f v2(vertices[ptr + 6], vertices[ptr + 7], vertices[ptr + 8]);
         const Eigen::Vector3d geometric_normal =
             (v1 - v0).cast<double>().cross((v2 - v0).cast<double>());
-        if (!geometric_normal.allFinite() || geometric_normal.squaredNorm() < 1e-40) {
+        // Only VXZM requires a valid signed face direction for its winding
+        // guard. Preserve the legacy VXZ treatment of degenerate triangles;
+        // the shared TBN helper already supplies its historical fallback.
+        if (multiSurface &&
+            (!geometric_normal.allFinite() || geometric_normal.squaredNorm() < 1e-40)) {
             continue;
         }
         // Normals
@@ -599,6 +636,13 @@ voxelize_trimesh_pbr_impl(
                 uv_barycentric.x() * uv0.x() + uv_barycentric.y() * uv1.x() + uv_barycentric.z() * uv2.x(),
                 uv_barycentric.x() * uv0.y() + uv_barycentric.y() * uv1.y() + uv_barycentric.z() * uv2.y()
             };
+            Eigen::Vector3f surface_n = {
+                uv_barycentric.x() * n0.x() + uv_barycentric.y() * n1.x() + uv_barycentric.z() * n2.x(),
+                uv_barycentric.x() * n0.y() + uv_barycentric.y() * n1.y() + uv_barycentric.z() * n2.y(),
+                uv_barycentric.x() * n0.z() + uv_barycentric.y() * n1.z() + uv_barycentric.z() * n2.z()
+            };
+            if (!surface_n.allFinite() || surface_n.squaredNorm() < 1e-20f) surface_n = n;
+            else surface_n.normalize();
             Eigen::Vector3f int_n = {
                 barycentric.x() * n0.x() + barycentric.y() * n1.x() + barycentric.z() * n2.x(),
                 barycentric.x() * n0.y() + barycentric.y() * n1.y() + barycentric.z() * n2.y(),
@@ -691,8 +735,17 @@ voxelize_trimesh_pbr_impl(
             }
 
             /// normal
-            float normal[3] = {int_n.x(), int_n.y(), int_n.z()};
-            if (normalTexture[mid]) {
+            // VXZM uses the mesh-authored surface normal (interpolated loop
+            // normals) but never a normal map. A signed geometric winding
+            // guard below keeps malformed back-to-back faces separate when
+            // they incorrectly reuse the same authored normal. The legacy
+            // VXZ path retains its previous behavior.
+            Eigen::Vector3f shading_basis_n = multiSurface ? surface_n : int_n;
+            float normal[3] = {shading_basis_n.x(), shading_basis_n.y(), shading_basis_n.z()};
+            // VXZM clustering and stored normals intentionally use surface
+            // normals only. The legacy VXZ path retains its existing normal
+            // map behavior.
+            if (!multiSurface && normalTexture[mid]) {
                 sample_texture_mipmap(
                     normalTexture[mid],
                     H_nTex[mid], W_nTex[mid], 3,
@@ -704,7 +757,7 @@ voxelize_trimesh_pbr_impl(
                 normal[0] = normal[0] * 2 - 1;
                 normal[1] = normal[1] * 2 - 1;
                 normal[2] = normal[2] * 2 - 1;
-                Eigen::Vector3f _n = (normal[0] * t + normal[1] * b + normal[2] * int_n).normalized();
+                Eigen::Vector3f _n = (normal[0] * t + normal[1] * b + normal[2] * shading_basis_n).normalized();
                 normal[0] = _n.x();
                 normal[1] = _n.y();
                 normal[2] = _n.z();
@@ -712,6 +765,22 @@ voxelize_trimesh_pbr_impl(
 
             // Write to voxel grid
             auto coord = VoxelCoord{x-grid_min.x(), y-grid_min.y(), z-grid_min.z()};
+            if (multiSurface) {
+                TORCH_CHECK(
+                    multi_samples.size() < maxMultiSamples,
+                    "Multi-surface input samples exceed max_total_records=",
+                    maxTotalRecords,
+                    "; increase the limit or use 0 for unlimited"
+                );
+                multi_samples.push_back({
+                    coord, weight,
+                    Eigen::Vector3f(baseColor[0], baseColor[1], baseColor[2]),
+                    metallic, roughness,
+                    Eigen::Vector3f(emissive[0], emissive[1], emissive[2]),
+                    alpha, surface_n, n
+                });
+                continue;
+            }
             auto kv = hash_table.find(coord);
             if (kv == hash_table.end()) {
                 hash_table[coord] = coords.size();
@@ -739,6 +808,147 @@ voxelize_trimesh_pbr_impl(
     end = clock();
     if (timing) std::cout << "Voxelization took " << double(end - start) / CLOCKS_PER_SEC << " seconds." << std::endl;
 
+    if (multiSurface) {
+        std::sort(multi_samples.begin(), multi_samples.end(), [](const auto &a, const auto &b) {
+            if (a.coord.x != b.coord.x) return a.coord.x < b.coord.x;
+            if (a.coord.y != b.coord.y) return a.coord.y < b.coord.y;
+            if (a.coord.z != b.coord.z) return a.coord.z < b.coord.z;
+            if (a.clusterNormal.x() != b.clusterNormal.x()) return a.clusterNormal.x() < b.clusterNormal.x();
+            if (a.clusterNormal.y() != b.clusterNormal.y()) return a.clusterNormal.y() < b.clusterNormal.y();
+            if (a.clusterNormal.z() != b.clusterNormal.z()) return a.clusterNormal.z() < b.clusterNormal.z();
+            // The geometric normal participates in the opposite-winding
+            // guard, so include it in the canonical sample ordering too.
+            // This keeps malformed coincident faces deterministic even when
+            // their authored normals and material attributes are identical.
+            if (a.geometricNormal.x() != b.geometricNormal.x()) return a.geometricNormal.x() < b.geometricNormal.x();
+            if (a.geometricNormal.y() != b.geometricNormal.y()) return a.geometricNormal.y() < b.geometricNormal.y();
+            if (a.geometricNormal.z() != b.geometricNormal.z()) return a.geometricNormal.z() < b.geometricNormal.z();
+            if (a.baseColor.x() != b.baseColor.x()) return a.baseColor.x() < b.baseColor.x();
+            if (a.baseColor.y() != b.baseColor.y()) return a.baseColor.y() < b.baseColor.y();
+            if (a.baseColor.z() != b.baseColor.z()) return a.baseColor.z() < b.baseColor.z();
+            if (a.metallic != b.metallic) return a.metallic < b.metallic;
+            if (a.roughness != b.roughness) return a.roughness < b.roughness;
+            if (a.emissive.x() != b.emissive.x()) return a.emissive.x() < b.emissive.x();
+            if (a.emissive.y() != b.emissive.y()) return a.emissive.y() < b.emissive.y();
+            if (a.emissive.z() != b.emissive.z()) return a.emissive.z() < b.emissive.z();
+            if (a.alpha != b.alpha) return a.alpha < b.alpha;
+            return a.weight < b.weight;
+        });
+
+        size_t begin = 0;
+        while (begin < multi_samples.size()) {
+            size_t end_group = begin + 1;
+            while (end_group < multi_samples.size() &&
+                   multi_samples[end_group].coord == multi_samples[begin].coord) {
+                ++end_group;
+            }
+            std::vector<size_t> cluster_indices;
+            std::vector<std::vector<Eigen::Vector3f>> cluster_members;
+            std::vector<std::vector<Eigen::Vector3f>> cluster_geometric_members;
+            for (size_t sample_idx = begin; sample_idx < end_group; ++sample_idx) {
+                const auto &sample = multi_samples[sample_idx];
+                size_t selected_local = std::numeric_limits<size_t>::max();
+                float selected_similarity = -2.0f;
+                for (size_t local = 0; local < cluster_members.size(); ++local) {
+                    bool compatible = true;
+                    for (size_t member_idx = 0;
+                         member_idx < cluster_members[local].size(); ++member_idx) {
+                        if (sample.clusterNormal.dot(cluster_members[local][member_idx]) < cluster_cosine ||
+                            sample.geometricNormal.dot(
+                                cluster_geometric_members[local][member_idx]) < -cluster_cosine) {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                    if (compatible) {
+                        const float similarity = sample.clusterNormal.dot(cluster_members[local].front());
+                        if (similarity > selected_similarity) {
+                            selected_local = local;
+                            selected_similarity = similarity;
+                        }
+                    }
+                }
+                if (selected_local == std::numeric_limits<size_t>::max()) {
+                    TORCH_CHECK(
+                        maxRecordsPerVoxel == 0 ||
+                        static_cast<int64_t>(cluster_indices.size()) < maxRecordsPerVoxel,
+                        "Multi-surface voxel (", sample.coord.x, ", ", sample.coord.y, ", ",
+                        sample.coord.z, ") exceeds max_records_per_voxel=", maxRecordsPerVoxel
+                    );
+                    TORCH_CHECK(
+                        maxTotalRecords == 0 ||
+                        static_cast<int64_t>(coords.size()) < maxTotalRecords,
+                        "Multi-surface output exceeds max_total_records=", maxTotalRecords
+                    );
+                    const size_t output_idx = coords.size();
+                    cluster_indices.push_back(output_idx);
+                    cluster_members.push_back({sample.clusterNormal});
+                    cluster_geometric_members.push_back({sample.geometricNormal});
+                    coords.push_back(sample.coord);
+                    buf_weights.push_back(sample.weight);
+                    buf_baseColors.push_back(sample.baseColor * sample.weight);
+                    buf_metallics.push_back(sample.metallic * sample.weight);
+                    buf_roughnesses.push_back(sample.roughness * sample.weight);
+                    buf_emissives.push_back(sample.emissive * sample.weight);
+                    buf_alphas.push_back(sample.alpha * sample.weight);
+                    // Store the same normal representation that defines the
+                    // cluster, so each record is self-describing.
+                    buf_normals.push_back(sample.clusterNormal * sample.weight);
+                } else {
+                    const size_t output_idx = cluster_indices[selected_local];
+                    cluster_members[selected_local].push_back(sample.clusterNormal);
+                    cluster_geometric_members[selected_local].push_back(sample.geometricNormal);
+                    buf_weights[output_idx] += sample.weight;
+                    buf_baseColors[output_idx] += sample.baseColor * sample.weight;
+                    buf_metallics[output_idx] += sample.metallic * sample.weight;
+                    buf_roughnesses[output_idx] += sample.roughness * sample.weight;
+                    buf_emissives[output_idx] += sample.emissive * sample.weight;
+                    buf_alphas[output_idx] += sample.alpha * sample.weight;
+                    buf_normals[output_idx] += sample.clusterNormal * sample.weight;
+                }
+            }
+
+            // If copied authored normals made opposite-winding clusters look
+            // identical, store their geometric normals so both VXZM records
+            // remain distinguishable. Correct authored surface normals remain
+            // authoritative for ordinary smooth and hard-shaded geometry.
+            std::vector<bool> use_geometric_normal(cluster_indices.size(), false);
+            for (size_t i = 0; i < cluster_indices.size(); ++i) {
+                Eigen::Vector3f ni = buf_normals[cluster_indices[i]];
+                if (ni.squaredNorm() > 1e-20f) ni.normalize();
+                for (size_t j = i + 1; j < cluster_indices.size(); ++j) {
+                    Eigen::Vector3f nj = buf_normals[cluster_indices[j]];
+                    if (nj.squaredNorm() > 1e-20f) nj.normalize();
+                    if (ni.dot(nj) < cluster_cosine) continue;
+                    bool opposite_winding = false;
+                    for (const auto &gi : cluster_geometric_members[i]) {
+                        for (const auto &gj : cluster_geometric_members[j]) {
+                            if (gi.dot(gj) < -cluster_cosine) {
+                                opposite_winding = true;
+                                break;
+                            }
+                        }
+                        if (opposite_winding) break;
+                    }
+                    if (opposite_winding) {
+                        use_geometric_normal[i] = true;
+                        use_geometric_normal[j] = true;
+                    }
+                }
+            }
+            for (size_t local = 0; local < cluster_indices.size(); ++local) {
+                if (!use_geometric_normal[local]) continue;
+                Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+                for (const auto &member : cluster_geometric_members[local]) sum += member;
+                if (sum.allFinite() && sum.squaredNorm() > 1e-20f) {
+                    buf_normals[cluster_indices[local]] = sum.normalized() *
+                        buf_weights[cluster_indices[local]];
+                }
+            }
+            begin = end_group;
+        }
+    }
+
     // Normalize buffers
     start = clock();
     std::vector<int> out_coord(coords.size() * 3);
@@ -761,9 +971,13 @@ voxelize_trimesh_pbr_impl(
         out_emissive[i * 3 + 1] = buf_emissives[i].y() / buf_weights[i];
         out_emissive[i * 3 + 2] = buf_emissives[i].z() / buf_weights[i];
         out_alpha[i] = buf_alphas[i] / buf_weights[i];
-        out_normal[i * 3 + 0] = buf_normals[i].x() / buf_weights[i];
-        out_normal[i * 3 + 1] = buf_normals[i].y() / buf_weights[i];
-        out_normal[i * 3 + 2] = buf_normals[i].z() / buf_weights[i];
+        Eigen::Vector3f averaged_normal = buf_normals[i] / buf_weights[i];
+        if (multiSurface && averaged_normal.allFinite() && averaged_normal.squaredNorm() > 1e-20f) {
+            averaged_normal.normalize();
+        }
+        out_normal[i * 3 + 0] = averaged_normal.x();
+        out_normal[i * 3 + 1] = averaged_normal.y();
+        out_normal[i * 3 + 2] = averaged_normal.z();
     }
     end = clock();
     if (timing) std::cout << "Normalization took " << double(end - start) / CLOCKS_PER_SEC << " seconds." << std::endl;
@@ -838,7 +1052,9 @@ textured_mesh_to_volumetric_attr_cpu(
                 "voxel_size must have 3 elements and grid_range 6 elements");
     TORCH_CHECK(voxel_size.scalar_type() == torch::kFloat32 && grid_range.scalar_type() == torch::kInt32,
                 "voxel_size must be float32 and grid_range int32");
-    TORCH_CHECK(torch::all(voxel_size > 0).item<bool>(), "voxel_size must be strictly positive");
+    TORCH_CHECK(torch::isfinite(voxel_size).all().item<bool>() &&
+                torch::all(voxel_size > 0).item<bool>(),
+                "voxel_size must contain finite, strictly positive values");
     TORCH_CHECK(vertices.scalar_type() == torch::kFloat32 && normals.scalar_type() == torch::kFloat32 &&
                 uvs.scalar_type() == torch::kFloat32 && materialIds.scalar_type() == torch::kInt32,
                 "vertices/normals/uvs must be float32 and materialIds int32");
@@ -850,6 +1066,12 @@ textured_mesh_to_volumetric_attr_cpu(
                 "uvs must have shape [N,3,2]");
     TORCH_CHECK(materialIds.dim() == 1 && materialIds.size(0) == N_tri,
                 "materialIds must have shape [N]");
+    TORCH_CHECK(torch::isfinite(vertices).all().item<bool>(),
+                "vertices must contain only finite values");
+    TORCH_CHECK(torch::isfinite(normals).all().item<bool>(),
+                "normals must contain only finite values");
+    TORCH_CHECK(torch::isfinite(uvs).all().item<bool>(),
+                "uvs must contain only finite values");
     if (N_tri > 0) {
         auto min_mid = materialIds.min().item<int>();
         auto max_mid = materialIds.max().item<int>();
@@ -1057,5 +1279,83 @@ textured_mesh_to_volumetric_attr_cpu(
         out_emissives,
         out_alphas,
         out_normals
+    );
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+textured_mesh_to_volumetric_attr_multi_cpu(
+    const torch::Tensor& voxel_size,
+    const torch::Tensor& grid_range,
+    const torch::Tensor& vertices,
+    const torch::Tensor& normals,
+    const torch::Tensor& uvs,
+    const torch::Tensor& materialIds,
+    const std::vector<torch::Tensor>& baseColorFactor,
+    const std::vector<torch::Tensor>& baseColorTexture,
+    const std::vector<int>& baseColorTextureFilter,
+    const std::vector<int>& baseColorTextureWrap,
+    const std::vector<float>& metallicFactor,
+    const std::vector<torch::Tensor>& metallicTexture,
+    const std::vector<int>& metallicTextureFilter,
+    const std::vector<int>& metallicTextureWrap,
+    const std::vector<float>& roughnessFactor,
+    const std::vector<torch::Tensor>& roughnessTexture,
+    const std::vector<int>& roughnessTextureFilter,
+    const std::vector<int>& roughnessTextureWrap,
+    const std::vector<torch::Tensor>& emissiveFactor,
+    const std::vector<torch::Tensor>& emissiveTexture,
+    const std::vector<int>& emissiveTextureFilter,
+    const std::vector<int>& emissiveTextureWrap,
+    const std::vector<int>& alphaMode,
+    const std::vector<float>& alphaCutoff,
+    const std::vector<float>& alphaFactor,
+    const std::vector<torch::Tensor>& alphaTexture,
+    const std::vector<int>& alphaTextureFilter,
+    const std::vector<int>& alphaTextureWrap,
+    const float mipLevelOffset,
+    const bool timing,
+    const bool addEmission,
+    const float clusterAngleDegrees,
+    const int64_t maxRecordsPerVoxel,
+    const int64_t maxTotalRecords
+) {
+    TORCH_CHECK(std::isfinite(clusterAngleDegrees) &&
+                clusterAngleDegrees > 0.0f && clusterAngleDegrees < 180.0f,
+                "clusterAngleDegrees must be in (0, 180)");
+    TORCH_CHECK(maxRecordsPerVoxel >= 0, "maxRecordsPerVoxel must be non-negative");
+    TORCH_CHECK(maxTotalRecords >= 0, "maxTotalRecords must be non-negative");
+    // The VXZM path deliberately has no normal-texture arguments.  Supply
+    // empty placeholders only while sharing the legacy material sampler;
+    // clustering and stored normals come exclusively from mesh surface
+    // normals. Authored mesh normals define the smooth surface normal, with a
+    // geometric winding guard for malformed back-to-back faces.
+    const size_t materialCount = baseColorFactor.size();
+    const std::vector<torch::Tensor> noNormalTexture(materialCount);
+    const std::vector<int> noNormalTextureFilter(materialCount, 0);
+    const std::vector<int> noNormalTextureWrap(materialCount, 0);
+    struct StateGuard {
+        StateGuard(float angle, int64_t perVoxel, int64_t total) {
+            g_multi_surface = true;
+            g_multi_surface_cluster_angle = angle;
+            g_multi_surface_max_records_per_voxel = perVoxel;
+            g_multi_surface_max_total_records = total;
+        }
+        ~StateGuard() {
+            g_multi_surface = false;
+            g_multi_surface_cluster_angle = 15.0f;
+            g_multi_surface_max_records_per_voxel = 0;
+            g_multi_surface_max_total_records = 0;
+        }
+    } guard(clusterAngleDegrees, maxRecordsPerVoxel, maxTotalRecords);
+    return textured_mesh_to_volumetric_attr_cpu(
+        voxel_size, grid_range, vertices, normals, uvs, materialIds,
+        baseColorFactor, baseColorTexture, baseColorTextureFilter, baseColorTextureWrap,
+        metallicFactor, metallicTexture, metallicTextureFilter, metallicTextureWrap,
+        roughnessFactor, roughnessTexture, roughnessTextureFilter, roughnessTextureWrap,
+        emissiveFactor, emissiveTexture, emissiveTextureFilter, emissiveTextureWrap,
+        alphaMode, alphaCutoff, alphaFactor, alphaTexture, alphaTextureFilter, alphaTextureWrap,
+        noNormalTexture, noNormalTextureFilter, noNormalTextureWrap,
+        mipLevelOffset, timing, addEmission
     );
 }

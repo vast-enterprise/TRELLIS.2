@@ -122,3 +122,61 @@ textured_mesh_to_volumetric_attr_cpu(
     const bool timing,
     const bool addEmission
 );
+
+/**
+ * Sample PBR attributes into a multi-surface voxel representation.
+ *
+ * Unlike the legacy entry point, this API deliberately has no normal-texture
+ * arguments.  `normals` contains mesh-authored corner/loop surface normals;
+ * those normals define clustering and the stored record normal.  Signed
+ * geometric face winding is retained internally as a guard so coincident
+ * faces with opposite winding cannot merge even when malformed input reuses
+ * the same authored normal for both faces.
+ *
+ * A sample can join a cluster only when its signed angular distance to every
+ * existing cluster member is no greater than `clusterAngleDegrees`.  This
+ * complete-link rule prevents transitive chains from exceeding the requested
+ * angular span.  Duplicate output coordinates are intentional: each output
+ * row is one independent surface-normal cluster in that voxel.
+ *
+ * `maxRecordsPerVoxel` and `maxTotalRecords` are optional safety limits; zero
+ * means unlimited.  `maxTotalRecords` also conservatively limits raw samples
+ * held before clustering.
+ */
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+textured_mesh_to_volumetric_attr_multi_cpu(
+    const torch::Tensor& voxel_size,
+    const torch::Tensor& grid_range,
+    const torch::Tensor& vertices,
+    const torch::Tensor& normals,
+    const torch::Tensor& uvs,
+    const torch::Tensor& materialIds,
+    const std::vector<torch::Tensor>& baseColorFactor,
+    const std::vector<torch::Tensor>& baseColorTexture,
+    const std::vector<int>& baseColorTextureFilter,
+    const std::vector<int>& baseColorTextureWrap,
+    const std::vector<float>& metallicFactor,
+    const std::vector<torch::Tensor>& metallicTexture,
+    const std::vector<int>& metallicTextureFilter,
+    const std::vector<int>& metallicTextureWrap,
+    const std::vector<float>& roughnessFactor,
+    const std::vector<torch::Tensor>& roughnessTexture,
+    const std::vector<int>& roughnessTextureFilter,
+    const std::vector<int>& roughnessTextureWrap,
+    const std::vector<torch::Tensor>& emissiveFactor,
+    const std::vector<torch::Tensor>& emissiveTexture,
+    const std::vector<int>& emissiveTextureFilter,
+    const std::vector<int>& emissiveTextureWrap,
+    const std::vector<int>& alphaMode,
+    const std::vector<float>& alphaCutoff,
+    const std::vector<float>& alphaFactor,
+    const std::vector<torch::Tensor>& alphaTexture,
+    const std::vector<int>& alphaTextureFilter,
+    const std::vector<int>& alphaTextureWrap,
+    const float mipLevelOffset,
+    const bool timing,
+    const bool addEmission,
+    const float clusterAngleDegrees,
+    const int64_t maxRecordsPerVoxel,
+    const int64_t maxTotalRecords
+);
