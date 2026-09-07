@@ -44,6 +44,33 @@ torch::Tensor decode_sparse_voxel_octree_cpu(
 );
 
 
+/**
+ * Safely decode a VXZM coarse SVO and reconstruct its fine-grid records.
+ *
+ * Unlike the legacy trusted SVO decoder, this entry point validates every
+ * octree byte boundary, the number of leaves, region counts, canonical local
+ * coordinate ordering, and all reconstructed coordinate bounds.
+ *
+ * @param octree       [S] uint8 coarse-region SVO
+ * @param counts       [R] int64 number of records in each region
+ * @param records      [N,C] uint8 interleaved records; XYZ are columns 0..2
+ * @param grid_size    [3] int64 fine-grid dimensions
+ * @param block_size   [3] int64 fine cells per coarse region
+ * @param depth        Coarse SVO depth
+ *
+ * @return             Fine coordinates [N,3], coarse coordinates [R,3], and
+ *                     the exact number of unique fine coordinates
+ */
+std::tuple<torch::Tensor, torch::Tensor, int64_t> decode_vxzm_records_cpu(
+    const torch::Tensor& octree,
+    const torch::Tensor& counts,
+    const torch::Tensor& records,
+    const torch::Tensor& grid_size,
+    const torch::Tensor& block_size,
+    const uint32_t depth
+);
+
+
 
 /**
  * Encode the attribute of a sparse voxel octree into deltas from its parent node.

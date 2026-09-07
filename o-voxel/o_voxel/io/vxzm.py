@@ -209,6 +209,66 @@ def _record_stride(info: Dict) -> int:
     return 3 + sum(channels)
 
 
+def _count_unique_coordinates(coords: np.ndarray,
+                              grid_size: np.ndarray) -> int:
+    """Count XYZ rows exactly through collision-free packed uint64 keys.
+
+    ``np.unique(coords, axis=0)`` internally constructs and sorts a structured
+    array.  That dominates VXZM decode time for multi-million-record files.
+    VXZM's validated grid is at most 262144 cells per axis, so the three
+    coordinates fit losslessly in one uint64 value and can use NumPy's much
+    faster one-dimensional unique path.
+    """
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError("VXZM coordinates must have shape [N,3]")
+    bits = [max(1, (int(size) - 1).bit_length()) for size in grid_size]
+    if sum(bits) > 64:
+        raise ValueError("VXZM grid coordinates do not fit a uint64 key")
+    keys = coords[:, 0].astype(np.uint64)
+    keys |= coords[:, 1].astype(np.uint64) << np.uint64(bits[0])
+    keys |= coords[:, 2].astype(np.uint64) << np.uint64(bits[0] + bits[1])
+    return int(np.unique(keys).size)
+
+
+def _decode_records_numpy(
+    region_code: np.ndarray,
+    counts: np.ndarray,
+    raw_records: np.ndarray,
+    block: np.ndarray,
+    grid_size: np.ndarray,
+):
+    """Vectorized fallback for extensions built before native VXZM decode."""
+    local = raw_records[:, :3]
+    if np.any(local >= block):
+        raise ValueError("VXZM local coordinate exceeds its region block")
+    expanded_regions = np.repeat(
+        region_code.astype(np.int32, copy=False),
+        counts.astype(np.intp, copy=False),
+        axis=0,
+    )
+    if expanded_regions.shape[0] != raw_records.shape[0]:
+        raise ValueError("VXZM records were not fully consumed")
+    coords = (expanded_regions * block.astype(np.int32) +
+              local.astype(np.int32, copy=False))
+    if len(local) > 1:
+        same_region = np.all(
+            expanded_regions[1:] == expanded_regions[:-1], axis=1,
+        )
+        out_of_order = (
+            (local[1:, 0] < local[:-1, 0]) |
+            ((local[1:, 0] == local[:-1, 0]) &
+             (local[1:, 1] < local[:-1, 1])) |
+            ((local[1:, 0] == local[:-1, 0]) &
+             (local[1:, 1] == local[:-1, 1]) &
+             (local[1:, 2] < local[:-1, 2]))
+        )
+        if np.any(same_region & out_of_order):
+            raise ValueError("VXZM local coordinates are not canonically ordered")
+    if np.any(coords < 0) or np.any(coords >= grid_size):
+        raise ValueError("VXZM reconstructed coordinate lies outside grid_size")
+    return coords, _count_unique_coordinates(coords, grid_size)
+
+
 def _validate_region_arrays(info: Dict, counts: np.ndarray,
                             offsets: np.ndarray, record_stride: int):
     if counts.size == 0 or np.any(counts == 0):
@@ -338,8 +398,6 @@ def read_vxzm(file, num_threads: int = -1, return_regions: bool = False):
             region_resolution & (region_resolution - 1)):
         raise ValueError("VXZM region_resolution must be a power of two in [4, 1024]")
     depth = region_resolution.bit_length() - 1
-    region_coord = _decode_region_svo(region_svo_bytes, depth, len(counts))
-    region_code = region_coord.numpy().astype(np.int64)
 
     layout = info["record_layout"]
     channels = sum(int(x["channels"]) for x in layout)
@@ -359,39 +417,54 @@ def read_vxzm(file, num_threads: int = -1, return_regions: bool = False):
     if (block.shape != (3,) or grid_size.shape != (3,) or region_grid_size.shape != (3,) or
             np.any(block <= 0) or np.any(grid_size <= 0) or np.any(region_grid_size <= 0) or
             np.any(block != np.ceil(grid_size / region_resolution).astype(np.int64)) or
-            np.any(region_grid_size != np.ceil(grid_size / block).astype(np.int64)) or
-            np.any(region_code < 0) or np.any(region_code >= region_grid_size)):
+            np.any(region_grid_size != np.ceil(grid_size / block).astype(np.int64))):
         raise ValueError("Invalid VXZM grid or region layout")
-    coords = np.empty((raw_records.shape[0], 3), dtype=np.int32)
-    attrs_np = {x["name"]: np.empty((raw_records.shape[0], int(x["channels"])), dtype=dtype)
-                for x in layout}
-    out_i = 0
     if int(info["num_records"]) != raw_records.shape[0]:
         raise ValueError("VXZM record count does not match header")
-    for rid, count in enumerate(counts.tolist()):
-        count = int(count)
-        if int(offsets[rid + 1] - offsets[rid]) != count * (3 + channels) * dtype.itemsize:
-            raise ValueError("VXZM region offset does not match count")
-        if count == 0:
-            continue
-        local = raw_records[out_i:out_i + count, :3].astype(np.int64)
-        if np.any(local >= block):
-            raise ValueError("VXZM local coordinate exceeds its region block")
-        coords[out_i:out_i + count] = (region_code[rid] * block + local).astype(np.int32)
-        ch = 3
-        for x in layout:
-            n = int(x["channels"])
-            attrs_np[x["name"]][out_i:out_i + count] = raw_records[out_i:out_i + count, ch:ch + n]
-            ch += n
-        out_i += count
-    if out_i != raw_records.shape[0]:
-        raise ValueError("VXZM records were not fully consumed")
-    if np.any(coords < 0) or np.any(coords >= grid_size):
-        raise ValueError("VXZM reconstructed coordinate lies outside grid_size")
-    if np.unique(coords, axis=0).shape[0] != int(info["num_unique_voxels"]):
+
+    if hasattr(_C, "decode_vxzm_records_cpu"):
+        # One writable copy supplies the native decoder and all attribute
+        # slices.  Native code performs bounded SVO parsing, canonical-order
+        # validation, region expansion, coordinate reconstruction, bounds
+        # checks, and exact unique counting in a single pass.
+        records_tensor = torch.from_numpy(raw_records.copy())
+        coords, region_coord, unique_count = _C.decode_vxzm_records_cpu(
+            torch.from_numpy(np.frombuffer(region_svo_bytes, dtype=np.uint8).copy()),
+            torch.from_numpy(counts.astype(np.int64)),
+            records_tensor,
+            torch.from_numpy(grid_size.copy()),
+            torch.from_numpy(block.copy()),
+            depth,
+        )
+        region_code = region_coord.numpy().astype(np.int64, copy=False)
+        if np.any(region_code < 0) or np.any(region_code >= region_grid_size):
+            raise ValueError("Invalid VXZM grid or region layout")
+        attr_source = records_tensor
+    else:
+        # Keep new Python code usable with a stale prebuilt extension.  It is
+        # already an order of magnitude faster than the original per-region
+        # implementation and retains collision-free unique-count validation.
+        region_coord = _decode_region_svo(region_svo_bytes, depth, len(counts))
+        region_code = region_coord.numpy().astype(np.int64)
+        if np.any(region_code < 0) or np.any(region_code >= region_grid_size):
+            raise ValueError("Invalid VXZM grid or region layout")
+        coords_np, unique_count = _decode_records_numpy(
+            region_code, counts, raw_records, block, grid_size,
+        )
+        coords = torch.from_numpy(coords_np)
+        attr_source = torch.from_numpy(raw_records.copy())
+
+    attr = {}
+    ch = 3
+    for x in layout:
+        n = int(x["channels"])
+        # Preserve the historical contiguous tensor contract.  The source is
+        # row-interleaved, so each named channel group needs one compact copy.
+        attr[x["name"]] = attr_source[:, ch:ch + n].contiguous()
+        ch += n
+    if int(unique_count) != int(info["num_unique_voxels"]):
         raise ValueError("VXZM unique voxel count does not match payload")
-    coord = torch.from_numpy(coords)
-    attr = {k: torch.from_numpy(v) for k, v in attrs_np.items()}
+    coord = coords
     if return_regions:
         return (
             coord,

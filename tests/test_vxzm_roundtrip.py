@@ -1,5 +1,6 @@
 """Format-level tests for duplicate-coordinate VXZM records."""
 from pathlib import Path
+import importlib
 import io
 import json
 import struct
@@ -13,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "o-voxel"))
 
 import o_voxel
+
+vxzm_module = importlib.import_module("o_voxel.io.vxzm")
 
 
 def main():
@@ -163,6 +166,48 @@ def main():
             raise AssertionError("incorrect unique voxel count was accepted")
         except ValueError as error:
             assert "unique voxel count" in str(error)
+
+        # The records section is canonical within each coarse region. Native
+        # decode uses adjacent local XYZ values for exact unique counting, so
+        # reject a payload that breaks this format invariant rather than
+        # silently accepting a misleading header count.
+        unordered = bytearray(blob)
+        record_start = header["binary_start"] + header["sections"]["records"][0]
+        record_stride = 3 + sum(value.shape[1] for value in attr.values())
+        # The first region contains local [0,0,0], [0,0,0], and [3,3,3].
+        first = bytes(unordered[record_start:record_start + record_stride])
+        third_start = record_start + 2 * record_stride
+        third = bytes(unordered[third_start:third_start + record_stride])
+        unordered[record_start:record_start + record_stride] = third
+        unordered[third_start:third_start + record_stride] = first
+        try:
+            o_voxel.io.read_vxzm(bytes(unordered))
+            raise AssertionError("non-canonical local coordinate order was accepted")
+        except ValueError as error:
+            assert "canonically ordered" in str(error), str(error)
+
+        # The vectorized NumPy fallback and compiled path must reconstruct the
+        # same record order. This keeps source updates usable before an
+        # extension rebuild without changing observable decode semantics.
+        region_svo = vxzm_module._section(blob, header, "region_svo")
+        counts = np.frombuffer(
+            vxzm_module._section(blob, header, "region_counts"), dtype="<u4",
+        )
+        record_bytes = vxzm_module._section(blob, header, "records")
+        raw_records = np.frombuffer(record_bytes, dtype=np.uint8).reshape(
+            -1, record_stride,
+        )
+        fallback_region = vxzm_module._decode_region_svo(
+            region_svo, int(header["region_resolution"]).bit_length() - 1,
+            len(counts),
+        ).numpy()
+        fallback_coord, fallback_unique = vxzm_module._decode_records_numpy(
+            fallback_region, counts, raw_records,
+            np.asarray(header["region_block_size"], dtype=np.int64),
+            np.asarray(header["grid_size"], dtype=np.int64),
+        )
+        assert np.array_equal(fallback_coord, got_coord.numpy())
+        assert fallback_unique == header["num_unique_voxels"]
 
         # The native SVO decoder assumes trusted bytes. VXZM validates the
         # preorder tree first so truncated or trailing nodes raise Python
