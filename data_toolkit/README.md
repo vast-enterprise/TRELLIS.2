@@ -224,6 +224,62 @@ python data_toolkit/encode_ss_latent.py --root datasets/ObjaverseXL_sketchfab --
 python data_toolkit/build_metadata.py ObjaverseXL --root datasets/ObjaverseXL_sketchfab
 ```
 
+### Caching PBR Latents from BOS
+
+For VXZ objects stored at
+`texture-surface-sample/sample_vxz/<uuid[:2]>/<uuid>.vxz`, use the dynamic
+multi-GPU cacher below. Every GPU claims the next UUID only after finishing
+its current one, so objects are not statically split by rank. The output is
+written to
+`texture-surface-sample/latentsvxz64/<uuid[:2]>/<uuid>.pt` in the format
+`{"coords": <int32 N x 3>, "latents": <float32 N x 32>}` used by the
+diffusion data readers.
+
+```bash
+export BOS_ACCESS_KEY_ID="..."
+export BOS_SECRET_ACCESS_KEY="..."
+python data_toolkit/cache_pbr_latent_bos.py \
+    --uuid-list /path/to/uuid_list.txt \
+    --start 0 --end 10000 \
+    --enc-pretrained /path/to/tex_enc_next_dc_f16c32_fp16 \
+    --num-gpus 8
+```
+
+The script skips existing BOS outputs by default, retries each failed UUID
+once, and writes failures to `cache_pbr_latent_failed.txt`. Use
+`--no-skip-existing` to overwrite existing outputs or `--gpus 0 2 3` to select
+specific visible devices. `--start` is inclusive and `--end` is exclusive;
+use these options to split the same list across machines. `--no-upload` runs
+the complete download/encode pipeline but discards each resulting latent.
+For a locally configured encoder checkpoint, pass
+`--model-root`, `--enc-model`, and `--ckpt` instead of `--enc-pretrained`.
+
+Before enabling uploads, the full BOS download and multi-GPU encoding path can
+be exercised while discarding every latent:
+
+```bash
+python data_toolkit/cache_pbr_latent_bos.py \
+    --uuid-list /path/to/uuid_list.txt \
+    --start 0 --end 10 \
+    --num-gpus 2 \
+    --no-upload \
+    --work-dir /tmp/cache_pbr_latent_smoke
+```
+
+To verify the encoder and decoder reconstruction on the first downloadable VXZ
+in a list slice, run:
+
+```bash
+python data_toolkit/verify_pbr_vae_bos.py \
+    --uuid-list /path/to/uuid_list.txt \
+    --start 0 --end 10 \
+    --device cuda:0 \
+    --output-dir /tmp/pbr_vae_roundtrip
+```
+
+This prints per-attribute reconstruction metrics and writes input/decoded PLY
+files for visual inspection.
+
 ### Step 7: Render Image Conditions
 
 Render multi-view images to train the image-conditioned generator.
