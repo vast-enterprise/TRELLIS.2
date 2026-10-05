@@ -55,10 +55,50 @@ Header:
 
 DEFAULT_COMPRESION_LEVEL = {
     'none': 0,
-    'deflate': 9,
+    # Fast defaults are intentional: callers that need maximum compression
+    # can still pass an explicit algorithm and level.
+    'deflate': 1,
     'lzma': 9,
-    'zstd': 22,
+    'zstd': 3,
 }
+
+# ``torch.unique(..., dim=0)`` is particularly slow on CPU for the millions
+# of rows produced at high voxel resolutions.  Chunk coordinates are small
+# int32 tensors, so moving just this tensor and its inverse map to CUDA keeps
+# the memory footprint modest while avoiding a large CPU sort.
+GPU_UNIQUE_MIN_ROWS = 1_000_000
+
+
+def _unique_dim0_with_inverse(
+    value: torch.Tensor,
+    *,
+    sorted: bool = True,
+):
+    """Run a large row-wise unique on CUDA when it is available.
+
+    The writer ultimately needs CPU tensors for slicing and serialization, so
+    results are copied back before returning.  CUDA OOM falls back to the CPU
+    implementation so a busy multi-process pod remains usable.
+    """
+    use_gpu = (
+        value.device.type == 'cpu'
+        and value.ndim == 2
+        and value.shape[0] >= GPU_UNIQUE_MIN_ROWS
+        and torch.cuda.is_available()
+    )
+    if not use_gpu:
+        return torch.unique(value, dim=0, sorted=sorted, return_inverse=True)
+    try:
+        unique_value, inverse = torch.unique(
+            value.to(device='cuda', non_blocking=True),
+            dim=0,
+            sorted=sorted,
+            return_inverse=True,
+        )
+        return unique_value.cpu(), inverse.cpu()
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return torch.unique(value, dim=0, sorted=sorted, return_inverse=True)
 
 
 def _compress(data: bytes, algo: Literal['none', 'deflate', 'lzma', 'zstd'], level: int) -> bytes:
@@ -226,7 +266,7 @@ def write_vxz(
     attr: Dict[str, torch.Tensor],
     chunk_size: int = 256,
     filter: Literal['none', 'parent', 'neighbor'] = 'none',
-    compression: Literal['none', 'deflate', 'lzma', 'zstd'] = 'lzma',
+    compression: Literal['none', 'deflate', 'lzma', 'zstd'] = 'zstd',
     compression_level: Optional[int] = None,
     attr_interleave: Literal['none', 'as_is', 'all'] = 'as_is',
     num_threads: int = -1,
@@ -276,7 +316,7 @@ def write_vxz(
     
     chunk_coord = coord // chunk_size 
     coord = coord % chunk_size
-    unique_chunk_coord, inverse = torch.unique(chunk_coord, dim=0, return_inverse=True)
+    unique_chunk_coord, inverse = _unique_dim0_with_inverse(chunk_coord)
     
     chunks = []
     for idx, chunk_xyz in enumerate(unique_chunk_coord.tolist()):

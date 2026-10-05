@@ -542,7 +542,9 @@ def write_vxzm(
         raise ValueError("local coordinate does not fit uint8; use a smaller region block")
 
     region_t = torch.from_numpy(region.astype(np.int32))
-    unique_region, inverse = torch.unique(region_t, dim=0, sorted=True, return_inverse=True)
+    from .vxz import _unique_dim0_with_inverse
+
+    unique_region, inverse = _unique_dim0_with_inverse(region_t, sorted=True)
     unique_codes = encode_seq(unique_region)
     region_order = torch.argsort(unique_codes)
     unique_region = unique_region[region_order]

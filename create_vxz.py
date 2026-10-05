@@ -344,9 +344,9 @@ def convert_dump(
 
     compression = args.compression
     if compression is None:
-        # Preserve the format writers' established defaults: legacy VXZ uses
-        # LZMA, while the independently chunked VXZM container uses Zstandard.
-        compression = "lzma" if args.output_format == "vxz" else "zstd"
+        # Use the fast default profile for both containers.  A caller can
+        # still request another codec or compression level explicitly.
+        compression = "zstd"
     if args.output_format == "vxz":
         # VXZ retains its historical schema.  The normal and separate
         # emissive debug attributes are not part of the legacy file.
@@ -396,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     emission.add_argument("--no-add-emission", dest="add_emission", action="store_false")
     parser.set_defaults(add_emission=True)
     parser.add_argument("--compression", choices=("none", "deflate", "lzma", "zstd"), default=None,
-                        help="Container compression (default: lzma for VXZ, zstd for VXZM)")
+                        help="Container compression (default: zstd level 3)")
     parser.add_argument("--compression-level", type=int, default=None)
     parser.add_argument("--normal-offset", type=float, default=0.08,
                         help="PLY-only normal separation in fine-voxel units")

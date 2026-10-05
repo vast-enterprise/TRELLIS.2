@@ -194,11 +194,21 @@ def intersect_voxels(
 
     validate("PBR", pbr_coord, pbr_attr)
     validate("geometry", geometry_coord, geometry_attr)
+    # The two CPU voxelizers normally emit the same unique coordinate rows in
+    # the same order.  Avoid the conversion, three sort-based membership
+    # operations, and copies of every PBR attribute in that common case.
+    if (
+        pbr_coord.device == geometry_coord.device
+        and pbr_coord.shape == geometry_coord.shape
+        and torch.equal(pbr_coord, geometry_coord)
+    ):
+        return pbr_coord, pbr_attr, geometry_coord, geometry_attr, int(len(geometry_coord))
+
     # A 1024^3 conversion can contain millions of rows. Python tuple sets
     # consume hundreds of bytes per coordinate, so encode XYZ losslessly into
-    # one uint64 and perform the membership tests in NumPy.  Joint minima and
-    # extents make the mapping valid even for signed coordinates, although
-    # production voxel coordinates are non-negative.
+    # one uint64.  Joint minima and extents make the mapping valid even for
+    # signed coordinates, although production voxel coordinates are
+    # non-negative.
     pbr_xyz = pbr_coord.detach().cpu().numpy().astype(np.int64, copy=False)
     geometry_xyz = geometry_coord.detach().cpu().numpy().astype(np.int64, copy=False)
     if len(pbr_xyz) == 0 or len(geometry_xyz) == 0:
@@ -223,14 +233,22 @@ def intersect_voxels(
 
         pbr_keys = keys(pbr_xyz)
         geometry_keys = keys(geometry_xyz)
-        if np.unique(geometry_keys).size != geometry_keys.size:
+        # Geometry rows must be unique.  Sort them once and reuse the sorted
+        # keys to join every PBR row by binary search.  The old path performed
+        # one unique and two independent sort-based isin operations.
+        geometry_order = np.argsort(geometry_keys, kind="stable")
+        sorted_geometry_keys = geometry_keys[geometry_order]
+        if np.any(sorted_geometry_keys[1:] == sorted_geometry_keys[:-1]):
             raise ValueError("geometry coordinates must be unique")
-        # Sort-based membership avoids allocating a dense table proportional
-        # to the entire 3-D grid while preserving every PBR row.
-        pbr_mask_np = np.isin(pbr_keys, geometry_keys, assume_unique=False, kind="sort")
-        common_keys = np.unique(pbr_keys[pbr_mask_np])
-        geometry_mask_np = np.isin(geometry_keys, common_keys, assume_unique=True, kind="sort")
-        common_count = int(common_keys.size)
+        positions = np.searchsorted(sorted_geometry_keys, pbr_keys)
+        pbr_mask_np = positions < len(sorted_geometry_keys)
+        candidate_positions = positions[pbr_mask_np]
+        pbr_mask_np[pbr_mask_np] = (
+            sorted_geometry_keys[candidate_positions] == pbr_keys[pbr_mask_np]
+        )
+        geometry_mask_np = np.zeros(len(geometry_keys), dtype=bool)
+        geometry_mask_np[geometry_order[positions[pbr_mask_np]]] = True
+        common_count = int(np.count_nonzero(geometry_mask_np))
 
     pbr_mask = torch.from_numpy(pbr_mask_np).to(device=pbr_coord.device)
     geometry_mask = torch.from_numpy(geometry_mask_np).to(device=geometry_coord.device)
@@ -278,7 +296,7 @@ def _write_pbr(path: Path, coord: "torch.Tensor", attr: Dict[str, "torch.Tensor"
 
     compression = args.compression
     if compression is None:
-        compression = "lzma" if args.output_format == "vxz" else "zstd"
+        compression = "zstd"
     if args.visualize:
         normal_offset = args.normal_offset if args.output_format == "vxzm" else 0.0
         write_color_ply(path, coord, attr, args.resolution, normal_offset)
@@ -308,7 +326,7 @@ def _write_geometry(
 ) -> None:
     import o_voxel
 
-    compression = args.geometry_compression or args.compression or "lzma"
+    compression = args.geometry_compression or args.compression or "zstd"
     path.parent.mkdir(parents=True, exist_ok=True)
     o_voxel.io.write_vxz(
         str(path), coord.int().cpu(), attr, compression=compression,
@@ -359,8 +377,10 @@ def build_parser() -> argparse.ArgumentParser:
     emission.add_argument("--add-emission", dest="add_emission", action="store_true")
     emission.add_argument("--no-add-emission", dest="add_emission", action="store_false")
     parser.set_defaults(add_emission=True)
-    parser.add_argument("--compression", choices=("none", "deflate", "lzma", "zstd"), default=None)
-    parser.add_argument("--geometry-compression", choices=("none", "deflate", "lzma", "zstd"), default=None)
+    parser.add_argument("--compression", choices=("none", "deflate", "lzma", "zstd"), default=None,
+                        help="PBR compression (default: zstd level 3)")
+    parser.add_argument("--geometry-compression", choices=("none", "deflate", "lzma", "zstd"), default=None,
+                        help="Geometry compression (default: zstd level 3)")
     parser.add_argument("--compression-level", type=int, default=None)
     parser.add_argument("--geometry-compression-level", type=int, default=None)
     parser.add_argument("--normal-offset", type=float, default=0.08,
