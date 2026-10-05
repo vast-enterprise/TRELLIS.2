@@ -22,11 +22,15 @@ from .vxz import _compress, _decompress, DEFAULT_COMPRESION_LEVEL
 
 __all__ = [
     "read_vxzm", "read_vxzm_info", "read_vxzm_regions", "write_vxzm",
-    "vxzm_to_ply",
+    "vxzm_to_ply", "vxzm_multi_sample_to_ply",
 ]
 
 MAGIC = b"VXZM"
-VERSION = 0
+VERSION = 2
+NORMAL_SOURCES = {0: "surface_authored_with_winding_guard",
+                  1: "geometry_reoriented_face_v1",
+                  2: "geometry_reoriented_face_v1"}
+TOPOLOGY_BITS = {'0': 'contributing_triangle_touches_multi_face_edge'}
 
 
 def _read_file(file) -> bytes:
@@ -43,7 +47,7 @@ def _parse_header(data: bytes, file_size: Optional[int] = None) -> Dict:
         raise ValueError("Truncated VXZM header")
     if data[:4] != MAGIC:
         raise ValueError("Invalid VXZM file type")
-    if data[4] != VERSION:
+    if data[4] not in NORMAL_SOURCES:
         raise ValueError(f"Unsupported VXZM version {data[4]}")
     header_end = struct.unpack(">I", data[5:9])[0]
     if header_end < 9 or header_end > len(data):
@@ -52,6 +56,10 @@ def _parse_header(data: bytes, file_size: Optional[int] = None) -> Dict:
         info = json.loads(data[9:header_end].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("Invalid VXZM JSON header") from error
+    if not isinstance(info, dict):
+        raise ValueError("VXZM header must be a JSON object")
+    if info.get("version") != data[4]:
+        raise ValueError("VXZM binary and JSON versions disagree")
     _validate_header(info, header_end, file_size)
     return info
 
@@ -60,7 +68,7 @@ def _validate_header(info: Dict, header_end: int,
                      file_size: Optional[int] = None):
     if not isinstance(info, dict):
         raise ValueError("VXZM header must be a JSON object")
-    if info.get("format") != "VXZM" or info.get("version") != VERSION:
+    if info.get("format") != "VXZM" or info.get("version") not in NORMAL_SOURCES:
         raise ValueError("Invalid VXZM header format/version")
     if int(info.get("binary_start", -1)) != header_end:
         raise ValueError("VXZM binary_start does not match JSON header end")
@@ -69,9 +77,9 @@ def _validate_header(info: Dict, header_end: int,
         raise ValueError(f"Invalid VXZM compression {compression!r}")
     if not isinstance(info.get("compression_level"), int):
         raise ValueError("Invalid VXZM compression_level")
-    if info.get("normal_source") != "surface_authored_with_winding_guard":
+    if info.get("normal_source") != NORMAL_SOURCES[info["version"]]:
         raise ValueError(
-            "VXZM normal_source must be 'surface_authored_with_winding_guard'"
+            "VXZM normal_source does not match the container version"
         )
 
     try:
@@ -102,6 +110,15 @@ def _validate_header(info: Dict, header_end: int,
             num_unique > num_records):
         raise ValueError("Invalid VXZM record counts")
     _record_stride(info)
+    if info['version'] in (1, 2):
+        channels = {v['name']: v['channels'] for v in info['record_layout']}
+        expected = {'base_color': 3, 'normal': 3, 'confidence': 1}
+        if info['version'] == 2:
+            expected['topology'] = 1
+            if info.get('topology_bits') != TOPOLOGY_BITS:
+                raise ValueError('VXZM v2 requires the defined topology bit semantics')
+        if channels != expected:
+            raise ValueError(f'VXZM v{info["version"]} requires {expected}')
 
     sections = info.get("sections")
     required = ("region_svo", "region_counts", "region_offsets", "records")
@@ -135,7 +152,7 @@ def _read_path_header(stream):
         raise ValueError("Truncated VXZM header")
     if prefix[:4] != MAGIC:
         raise ValueError("Invalid VXZM file type")
-    if prefix[4] != VERSION:
+    if prefix[4] not in NORMAL_SOURCES:
         raise ValueError(f"Unsupported VXZM version {prefix[4]}")
     header_end = struct.unpack(">I", prefix[5:9])[0]
     stream.seek(0, os.SEEK_END)
@@ -386,7 +403,7 @@ def read_vxzm(file, num_threads: int = -1, return_regions: bool = False):
     """
     data = _read_file(file)
     info = _parse_header(data, len(data))
-    if info.get("format") != "VXZM" or int(info.get("version", -1)) != VERSION:
+    if info.get("format") != "VXZM" or int(info.get("version", -1)) not in NORMAL_SOURCES:
         raise ValueError("Invalid VXZM header")
 
     region_svo_bytes = _section(data, info, "region_svo")
@@ -486,6 +503,7 @@ def write_vxzm(
     compression: Literal["none", "deflate", "lzma", "zstd"] = "zstd",
     compression_level: Optional[int] = None,
     metadata: Optional[Dict] = None,
+    normal_source: str = "surface_authored_with_winding_guard",
 ):
     """Write multi-surface voxel records to VXZM.
 
@@ -494,6 +512,17 @@ def write_vxzm(
     local coordinates, while the coarse region tree stores the 256^3 region
     positions in Morton order.
     """
+    versions = {source: version for version, source in NORMAL_SOURCES.items()}
+    if normal_source not in versions:
+        raise ValueError(f'Unsupported VXZM normal_source: {normal_source}')
+    version = versions[normal_source]
+    if normal_source == 'geometry_reoriented_face_v1':
+        version = 2 if 'topology' in attr else 1
+        expected = {'base_color': 3, 'normal': 3, 'confidence': 1}
+        if version == 2:
+            expected['topology'] = 1
+        if {k: v.shape[1] for k, v in attr.items() if v.ndim == 2} != expected:
+            raise ValueError(f'VXZM v{version} requires {expected}')
     if coord.ndim != 2 or coord.shape[1] != 3:
         raise ValueError("coord must have shape [N, 3]")
     if coord.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint16):
@@ -556,6 +585,13 @@ def write_vxzm(
     rid = rid[order]
     local = local[order]
     attr_np = {name: value.detach().cpu().numpy()[order] for name, value in attr.items()}
+    # Records are now ordered by region and local XYZ.  Reuse this ordering to
+    # count unique fine voxels instead of running a second O(N log N) global
+    # ``np.unique(coord_np, axis=0)`` over millions of records.
+    sorted_coord = unique_region.numpy()[rid] * block + local
+    unique_voxel_count = 1 + int(np.count_nonzero(
+        np.any(sorted_coord[1:] != sorted_coord[:-1], axis=1)
+    )) if n else 0
     counts64 = np.bincount(rid, minlength=len(unique_region)).astype(np.uint64)
     if np.any(counts64 > np.iinfo(np.uint32).max):
         raise ValueError("a VXZM region record count does not fit uint32")
@@ -595,22 +631,24 @@ def write_vxzm(
         binary += packed
     header = {
         "format": "VXZM",
-        "version": VERSION,
+        "version": version,
         "grid_size": grid_size.tolist(),
         "region_resolution": int(region_resolution),
         "region_block_size": block.tolist(),
         "region_grid_size": region_grid.tolist(),
         "num_regions": int(len(unique_region)),
         "num_records": int(n),
-        "num_unique_voxels": int(np.unique(coord_np, axis=0).shape[0]),
+        "num_unique_voxels": unique_voxel_count,
         "sections": sections,
         "compression": compression,
         "compression_level": int(level),
-        "normal_source": "surface_authored_with_winding_guard",
+        "normal_source": normal_source,
         "record_dtype": "u1",
         "record_layout": [{"name": name, "dtype": "u1", "channels": int(value.shape[1])}
                           for name, value in attr.items()],
     }
+    if version == 2:
+        header['topology_bits'] = dict(TOPOLOGY_BITS)
     if metadata is not None:
         # Keep format-controlled keys authoritative and store caller details
         # in a namespaced object that remains JSON serializable.
@@ -626,7 +664,7 @@ def write_vxzm(
         if header["binary_start"] == binary_start:
             break
         header["binary_start"] = binary_start
-    blob = MAGIC + bytes([VERSION]) + struct.pack(">I", 9 + len(encoded)) + encoded + binary
+    blob = MAGIC + bytes([version]) + struct.pack(">I", 9 + len(encoded)) + encoded + binary
     if isinstance(file, (str, os.PathLike)):
         # Complete the file atomically so an interrupted compression/write is
         # never mistaken for a valid cached asset by the data pipeline.
@@ -655,12 +693,20 @@ def vxzm_to_ply(
     ply_file,
     aabb=((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)),
     normal_offset: float = 0.0,
+    max_points: Optional[int] = None,
+    multi_sample_only: bool = False,
+    min_samples: int = 2,
 ):
     """Export every VXZM record as an Open3D point with RGB and normal.
 
     ``normal_offset`` is expressed in fine-voxel units and affects only the
     visualization. It can make coincident normal clusters separately visible;
-    stored VXZM coordinates are never changed.
+    stored VXZM coordinates are never changed. ``max_points`` optionally
+    selects a deterministic, evenly spaced subset for interactive viewers.
+    When ``multi_sample_only`` is true, records are first grouped by their
+    decoded fine-voxel coordinate and only groups with at least
+    ``min_samples`` records are exported.  Every record in a selected group
+    is retained; no RGB or normal averaging is performed.
     """
     import open3d as o3d
 
@@ -670,6 +716,38 @@ def vxzm_to_ply(
     data = _read_file(vxzm_file)
     info = read_vxzm_info(data)
     coord, attr = read_vxzm(data)
+    if not isinstance(min_samples, (int, np.integer)) or min_samples < 2:
+        raise ValueError("min_samples must be an integer >= 2")
+    if multi_sample_only:
+        coord_np = coord.numpy()
+        # VXZM records are canonically ordered by region and local XYZ, but
+        # sort explicitly here so this visualization remains correct for a
+        # tensor returned by a custom reader as well.  The run mask is then
+        # scattered back without collapsing duplicate normal/color records.
+        if len(coord_np) == 0:
+            keep = np.zeros(0, dtype=bool)
+        else:
+            order = np.lexsort((coord_np[:, 2], coord_np[:, 1], coord_np[:, 0]))
+            sorted_coord = coord_np[order]
+            starts = np.empty(len(sorted_coord), dtype=bool)
+            starts[0] = True
+            starts[1:] = np.any(sorted_coord[1:] != sorted_coord[:-1], axis=1)
+            group_starts = np.flatnonzero(starts)
+            group_ends = np.r_[group_starts[1:], len(sorted_coord)]
+            group_sizes = group_ends - group_starts
+            keep_sorted = np.repeat(group_sizes >= int(min_samples), group_sizes)
+            keep = np.zeros(len(coord_np), dtype=bool)
+            keep[order] = keep_sorted
+        keep_t = torch.from_numpy(keep)
+        coord = coord[keep_t]
+        attr = {name: value[keep_t] for name, value in attr.items()}
+    if max_points is not None:
+        if not isinstance(max_points, (int, np.integer)) or max_points <= 0:
+            raise ValueError("max_points must be a positive integer or None")
+        if max_points < len(coord):
+            indices = torch.linspace(0, len(coord) - 1, int(max_points), dtype=torch.int64)
+            coord = coord[indices]
+            attr = {name: value[indices] for name, value in attr.items()}
     if "base_color" not in attr or attr["base_color"].shape[1] != 3:
         raise ValueError("VXZM PLY export requires base_color[3]")
     if "normal" not in attr or attr["normal"].shape[1] != 3:
@@ -688,7 +766,42 @@ def vxzm_to_ply(
     cloud.points = o3d.utility.Vector3dVector(points)
     cloud.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
     cloud.normals = o3d.utility.Vector3dVector(normals)
-    if not o3d.io.write_point_cloud(str(ply_file), cloud, write_ascii=False,
-                                    compressed=False, print_progress=False):
+    if len(points) == 0:
+        # Open3D intentionally refuses to write an empty cloud.  Still emit a
+        # valid, self-describing PLY so a filter that finds no colliding voxel
+        # can be inspected or consumed by ordinary PLY readers.
+        with open(ply_file, "wb") as stream:
+            stream.write(
+                b"ply\nformat ascii 1.0\n"
+                b"element vertex 0\n"
+                b"property float x\nproperty float y\nproperty float z\n"
+                b"property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                b"property float nx\nproperty float ny\nproperty float nz\n"
+                b"end_header\n"
+            )
+    elif not o3d.io.write_point_cloud(str(ply_file), cloud, write_ascii=False,
+                                      compressed=False, print_progress=False):
         raise RuntimeError(f"Open3D failed to write {ply_file}")
     return coord, attr
+
+
+def vxzm_multi_sample_to_ply(
+    vxzm_file,
+    ply_file,
+    aabb=((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)),
+    normal_offset: float = 0.0,
+    min_samples: int = 2,
+    max_points: Optional[int] = None,
+):
+    """Export only fine voxels represented by multiple VXZM records.
+
+    This is a convenience wrapper around :func:`vxzm_to_ply`; it is useful
+    for inspecting multi-surface and sharp-edge samples after decoding a VXZM
+    file.  Coincident records remain separate and are displaced only for
+    display by ``normal_offset``.
+    """
+    return vxzm_to_ply(
+        vxzm_file, ply_file, aabb=aabb, normal_offset=normal_offset,
+        max_points=max_points, multi_sample_only=True,
+        min_samples=min_samples,
+    )

@@ -180,3 +180,44 @@ textured_mesh_to_volumetric_attr_multi_cpu(
     const int64_t maxRecordsPerVoxel,
     const int64_t maxTotalRecords
 );
+
+
+// Same samples as multi_cpu, with OR-reduced source-triangle topology flags.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+textured_mesh_to_volumetric_attr_multi_topology_cpu(
+    const torch::Tensor& voxel_size,
+    const torch::Tensor& grid_range,
+    const torch::Tensor& vertices,
+    const torch::Tensor& normals,
+    const torch::Tensor& uvs,
+    const torch::Tensor& materialIds,
+    const std::vector<torch::Tensor>& baseColorFactor,
+    const std::vector<torch::Tensor>& baseColorTexture,
+    const std::vector<int>& baseColorTextureFilter,
+    const std::vector<int>& baseColorTextureWrap,
+    const std::vector<float>& metallicFactor,
+    const std::vector<torch::Tensor>& metallicTexture,
+    const std::vector<int>& metallicTextureFilter,
+    const std::vector<int>& metallicTextureWrap,
+    const std::vector<float>& roughnessFactor,
+    const std::vector<torch::Tensor>& roughnessTexture,
+    const std::vector<int>& roughnessTextureFilter,
+    const std::vector<int>& roughnessTextureWrap,
+    const std::vector<torch::Tensor>& emissiveFactor,
+    const std::vector<torch::Tensor>& emissiveTexture,
+    const std::vector<int>& emissiveTextureFilter,
+    const std::vector<int>& emissiveTextureWrap,
+    const std::vector<int>& alphaMode,
+    const std::vector<float>& alphaCutoff,
+    const std::vector<float>& alphaFactor,
+    const std::vector<torch::Tensor>& alphaTexture,
+    const std::vector<int>& alphaTextureFilter,
+    const std::vector<int>& alphaTextureWrap,
+    const float mipLevelOffset,
+    const bool timing,
+    const bool addEmission,
+    const float clusterAngleDegrees,
+    const int64_t maxRecordsPerVoxel,
+    const int64_t maxTotalRecords,
+    const torch::Tensor& triangleTopology
+);

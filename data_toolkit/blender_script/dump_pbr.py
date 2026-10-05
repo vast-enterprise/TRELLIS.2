@@ -6,6 +6,9 @@ import numpy as np
 from PIL import Image
 import pickle
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from geometry_normals import clean_geometry, triangle_normals, triangle_topology, NORMAL_SOURCE
+
 
 """=============== BLENDER ==============="""
 
@@ -339,11 +342,11 @@ def main(arg):
     output = {
         'materials': [],
         'objects': [],
-        # VXZM relies on these authored corner normals for clustering.  Keep
-        # an explicit provenance marker so old BMesh-generated dumps (whose
-        # normals may be zero or in a different frame) are never reused
-        # silently as equivalent data.
-        'surface_normal_source': 'blender_authored_corner_world_v1',
+        # File-level provenance prevents geometry/authored caches being mixed.
+        'surface_normal_source': NORMAL_SOURCE if arg.renormal else 'blender_authored_corner_world_v1',
+        'normal_preprocessing': {'renormal': arg.renormal, 'merge_distance': arg.merge_distance,
+                                 'max_edge_faces': arg.max_edge_faces,
+                                 'algorithm': 'manifold_patches_v2'},
     }
 
     # Dumping materials
@@ -532,44 +535,39 @@ def main(arg):
         eval_obj = obj.evaluated_get(depsgraph)
         eval_mesh = eval_obj.to_mesh()
         try:
-            # ``loop_triangles`` gives a non-destructive triangulation whose
-            # loop indices still address imported custom/split normals and UVs.
-            # Converting through BMesh invalidates those authored normals and
-            # can leave all-zero loop normals until a geometric recomputation,
-            # which is not the surface-normal semantics required by VXZM.
-            eval_mesh.calc_loop_triangles()
-            eval_mesh.calc_normals_split()
-            triangles = list(eval_mesh.loop_triangles)
             world_matrix = eval_obj.matrix_world.copy()
-            normal_matrix = world_matrix.to_3x3().inverted_safe().transposed()
-
-            pack["vertices"] = np.array([
-                (world_matrix @ v.co)[:] for v in eval_mesh.vertices
-            ], dtype=np.float32)   # (N, 3), world space
-
-            pack["faces"] = np.array([
+            if arg.renormal:
+                stats = clean_geometry(eval_mesh, world_matrix, arg.merge_distance, arg.max_edge_faces)
+                print(f"[INFO] Re-normal {obj.name}: {stats}", flush=True)
+                pack['normal_preprocessing'] = stats
+            eval_mesh.calc_loop_triangles()
+            triangles = list(eval_mesh.loop_triangles)
+            pack["vertices"] = np.asarray([
+                v.co[:] if arg.renormal else (world_matrix @ v.co)[:]
+                for v in eval_mesh.vertices
+            ], dtype=np.float32).reshape(-1, 3)
+            pack["faces"] = np.asarray([
                 list(triangle.vertices) for triangle in triangles
-            ], dtype=np.int32).reshape(-1, 3)   # (F, 3)
-
-            transformed_normals = []
-            for triangle in triangles:
-                # ``corner_normals`` preserves mesh-authored split/corner
-                # normals (including smooth shading).  Transform them
-                # with the inverse-transpose so non-uniform object scale is
-                # handled correctly.  A zero/invalid authored normal remains
-                # zero and is safely replaced by the geometric face normal in
-                # the native VXZM sampler.
-                triangle_normals = []
-                for loop_index in triangle.loops:
-                    local_normal = eval_mesh.corner_normals[loop_index].vector
-                    world_normal = normal_matrix @ Vector(local_normal)
-                    if world_normal.length_squared > 1e-20:
-                        world_normal.normalize()
-                    triangle_normals.append(world_normal[:])
-                transformed_normals.append(triangle_normals)
-            pack["normals"] = np.asarray(
-                transformed_normals, dtype=np.float32
-            ).reshape(-1, 3, 3)  # (F, 3, 3), world space
+            ], dtype=np.int32).reshape(-1, 3)
+            if arg.renormal:
+                pack["normals"] = triangle_normals(pack["vertices"], pack["faces"])
+                pack['topology'] = triangle_topology(eval_mesh)
+            else:
+                # Blender >=4.1 removed calc_normals_split; corner_normals
+                # is evaluated lazily. Keep authored semantics only on opt-out.
+                if hasattr(eval_mesh, 'calc_normals_split'):
+                    eval_mesh.calc_normals_split()
+                normal_matrix = world_matrix.to_3x3().inverted_safe().transposed()
+                transformed_normals = []
+                for triangle in triangles:
+                    row = []
+                    for loop_index in triangle.loops:
+                        n = normal_matrix @ eval_mesh.corner_normals[loop_index].vector
+                        if n.length_squared > 1e-20:
+                            n.normalize()
+                        row.append(n[:])
+                    transformed_normals.append(row)
+                pack['normals'] = np.asarray(transformed_normals, dtype=np.float32).reshape(-1, 3, 3)
 
             if eval_mesh.uv_layers.active is not None:
                 uv_data = eval_mesh.uv_layers.active.data
@@ -599,9 +597,26 @@ def main(arg):
         
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Renders given obj file by rotation a camera around it.')
+    parser.add_argument('--renormal', action=argparse.BooleanOptionalAction, default=True,
+                        help='Repair winding and export geometry normals (default: enabled)')
+    parser.add_argument('--merge-distance', type=float, default=1e-7,
+                        help='World-space weld distance after scene normalization; 0 disables welding')
+    parser.add_argument('--max-edge-faces', type=int, default=0,
+                        help='0 allows multi-face junctions; 2 is strict manifold; 3 allows three-face edges')
     parser.add_argument('--object', type=str, help='Path to the 3D model file to be rendered.')
     parser.add_argument('--output_path', type=str, default='/tmp', help='The path the output will be dumped to.')
     argv = sys.argv[sys.argv.index("--") + 1:]
     args = parser.parse_args(argv)
 
-    main(args)
+    # Failed runs must not leave a previous dump that a caller could reuse.
+    if os.path.exists(args.output_path):
+        os.unlink(args.output_path)
+    try:
+        main(args)
+    except Exception as error:
+        if os.path.exists(args.output_path):
+            os.unlink(args.output_path)
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
+        with open(args.output_path + '_error.txt', 'w') as stream:
+            stream.write(str(error))
+        raise

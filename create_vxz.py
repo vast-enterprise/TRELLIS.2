@@ -211,7 +211,9 @@ def upload_file(
     return key
 
 
-def run_blender_dump(blender: str, glb_path: Path, dump_path: Path) -> None:
+def run_blender_dump(blender: str, glb_path: Path, dump_path: Path,
+                     renormal: bool = True, merge_distance: float = 1e-7,
+                     max_edge_faces: int = 0) -> None:
     """Run the repository's Blender PBR dump script."""
     if not DUMP_SCRIPT.is_file():
         raise FileNotFoundError(f"Blender dump script not found: {DUMP_SCRIPT}")
@@ -219,6 +221,7 @@ def run_blender_dump(blender: str, glb_path: Path, dump_path: Path) -> None:
     cmd = [
         blender,
         "-b",
+        "--python-exit-code", "1",
         "-P",
         str(DUMP_SCRIPT),
         "--",
@@ -227,6 +230,11 @@ def run_blender_dump(blender: str, glb_path: Path, dump_path: Path) -> None:
         "--output_path",
         str(dump_path),
     ]
+    cmd.extend(['--renormal' if renormal else '--no-renormal',
+                '--merge-distance', str(merge_distance),
+                '--max-edge-faces', str(max_edge_faces)])
+    # A failed Blender process must never cause a stale pickle to be read.
+    dump_path.unlink(missing_ok=True)
     print("Running Blender PBR dump:", " ".join(cmd))
     error_path = dump_path.with_name(dump_path.name + "_error.txt")
     try:
@@ -333,6 +341,11 @@ def convert_dump(
             **common,
         )
 
+    geometry_normals = dump.get('surface_normal_source') == 'blender_geometry_reoriented_face_world_v1'
+    if getattr(args, 'pure_vxzm', False) and not geometry_normals:
+        from o_voxel.convert.volumetic_attr import record_confidence
+        attr = {name: attr[name] for name in ('base_color', 'normal')} | {
+            'confidence': record_confidence(coord)}
     if coord.ndim != 2 or coord.shape[1] != 3 or coord.shape[0] == 0:
         raise RuntimeError(f"Voxelizer returned invalid coordinates: {tuple(coord.shape)}")
     if args.visualize:
@@ -363,14 +376,22 @@ def convert_dump(
             region_resolution=args.region_resolution,
             compression=compression,
             compression_level=args.compression_level,
-            metadata=_write_metadata(args),
+            metadata={**_write_metadata(args),
+                      'normal_preprocessing': dump.get('normal_preprocessing', {}),
+                      **({'topology_source': 'source_triangle_multi_face_edge_v1'}
+                         if 'topology' in attr else {}),
+                      **({'confidence_source': 'cluster_count_v1'}
+                         if 'confidence' in attr else {}),
+                      'merge_weight': 'closest_point_gaussian_voxel_v1'},
+            normal_source=('geometry_reoriented_face_v1' if geometry_normals
+                           else 'surface_authored_with_winding_guard'),
         )
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"O-Voxel writer did not produce {output_path}")
     return output_path, int(coord.shape[0])
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(pure_vxzm=False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("uuid", nargs="?", type=_validate_uuid,
                         help="GLB UUID stored in BOS")
@@ -383,8 +404,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Final local path; otherwise <output-dir>/<uuid>.<suffix>")
     parser.add_argument("--blender", default="blender", help="Blender executable")
     parser.add_argument("--resolution", type=int, default=1024)
-    parser.add_argument("--output-format", "--format", dest="output_format",
-                        choices=("vxz", "vxzm"), default="vxz")
+    if not pure_vxzm:
+        parser.add_argument("--output-format", "--format", dest="output_format",
+                            choices=("vxz", "vxzm"), default="vxz")
+    parser.add_argument('--renormal', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--merge-distance', type=float, default=1e-7)
+    parser.add_argument('--max-edge-faces', type=_non_negative_int, default=0,
+                        help='0 allows all edge degrees; 2 is strict; 3 allows three-face junctions')
     parser.add_argument("--region-resolution", type=int, default=256)
     parser.add_argument("--cluster-angle-degrees", type=float, default=15.0)
     parser.add_argument("--max-records-per-voxel", type=_non_negative_int, default=0)
@@ -398,10 +424,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compression", choices=("none", "deflate", "lzma", "zstd"), default=None,
                         help="Container compression (default: zstd level 3)")
     parser.add_argument("--compression-level", type=int, default=None)
-    parser.add_argument("--normal-offset", type=float, default=0.08,
-                        help="PLY-only normal separation in fine-voxel units")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Write a colored PLY directly; do not create .vxz/.vxzm")
+    parser.set_defaults(normal_offset=0.08)
+    if not pure_vxzm:
+        parser.add_argument("--normal-offset", type=float, default=0.08,
+                            help="PLY-only normal separation in fine-voxel units")
+    if not pure_vxzm:
+        parser.add_argument("--visualize", action="store_true",
+                            help="Write a colored PLY directly; do not create .vxz/.vxzm")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--timing", action="store_true")
 
@@ -421,11 +450,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Explicit BOS object key; default is <upload-folder>/<uuid[:2]>/<filename>")
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace an existing local output")
+    parser.set_defaults(pure_vxzm=pure_vxzm)
+    if pure_vxzm:
+        parser.description = 'Download a GLB by UUID and write only RGB/normal/confidence/topology VXZM.'
+        parser.set_defaults(output_format='vxzm', visualize=False,
+                            output_dir=Path('./vxzm_outputs'),
+                            upload_folder=os.getenv('BOS_OUTPUT_FOLDER', 'sample_vxzm'))
     return parser
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = build_parser()
+def main(argv: Optional[list[str]] = None, *, pure_vxzm=False) -> int:
+    parser = build_parser(pure_vxzm=pure_vxzm)
     args = parser.parse_args(argv)
     if args.uuid is None:
         args.uuid = args.uuid_option
@@ -433,6 +468,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("positional uuid and --uuid must match")
     if args.uuid is None:
         parser.error("a GLB uuid is required (positional argument or --uuid)")
+    import math
+    if not math.isfinite(args.merge_distance) or args.merge_distance < 0:
+        parser.error('--merge-distance must be finite and non-negative')
+    if args.max_edge_faces == 1:
+        parser.error('--max-edge-faces must be 0 or >=2')
     if args.resolution <= 1:
         parser.error("--resolution must be greater than 1")
     if args.output_format == "vxzm":
@@ -461,7 +501,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     dump_path = args.cache_dir / f"{args.uuid}.pbr.pkl"
     try:
         download_glb(client, args.bos_bucket, args.bos_folder, args.uuid, glb_path)
-        run_blender_dump(args.blender, glb_path, dump_path)
+        if args.renormal and args.merge_distance == 1e-7 and args.max_edge_faces == 0:
+            run_blender_dump(args.blender, glb_path, dump_path)
+        else:
+            run_blender_dump(args.blender, glb_path, dump_path,
+                             renormal=args.renormal, merge_distance=args.merge_distance,
+                             max_edge_faces=args.max_edge_faces)
         dump = _load_dump(dump_path)
         final_path, record_count = convert_dump(dump, args, output_path)
         print(f"Wrote {final_path} ({record_count} {'records' if args.output_format == 'vxzm' else 'voxels'})")

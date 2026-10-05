@@ -21,7 +21,8 @@ import trimesh
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
-from test_glb_to_vxz import run_blender_dump
+sys.path.insert(0, str(ROOT))
+from create_vxz import run_blender_dump
 
 
 def main() -> None:
@@ -64,7 +65,7 @@ def main() -> None:
         # so the test exercises authored data instead of Blender's fallback.
         from trimesh.exchange.gltf import export_glb
         glb_path.write_bytes(export_glb(scene, include_normals=True))
-        run_blender_dump(args.blender, glb_path, dump_path)
+        run_blender_dump(args.blender, glb_path, dump_path, renormal=False)
         with dump_path.open("rb") as stream:
             dump = pickle.load(stream)
 

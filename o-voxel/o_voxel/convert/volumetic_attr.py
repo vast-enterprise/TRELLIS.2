@@ -25,6 +25,8 @@ ALPHA_MODE_ENUM = {
 }
 
 BLENDER_DUMP_SURFACE_NORMAL_SOURCE = 'blender_authored_corner_world_v1'
+GEOMETRY_NORMAL_SOURCE = 'blender_geometry_reoriented_face_world_v1'
+DUMP_NORMAL_SOURCES = (BLENDER_DUMP_SURFACE_NORMAL_SOURCE, GEOMETRY_NORMAL_SOURCE)
 
 
 def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
@@ -344,10 +346,10 @@ def blender_dump_to_volumetric_attr(
     if max_total_records < 0:
         raise ValueError("max_total_records must be non-negative")
     if (multi_surface and
-            dump.get('surface_normal_source') != BLENDER_DUMP_SURFACE_NORMAL_SOURCE):
+            dump.get('surface_normal_source') not in DUMP_NORMAL_SOURCES):
         raise ValueError(
             "VXZM requires a current Blender dump with world-space authored "
-            "corner normals; regenerate the GLB dump with dump_pbr.py"
+            "corner normals or canonical geometry normals; regenerate the GLB dump with dump_pbr.py"
         )
     # Voxelize settings
     assert voxel_size is not None or grid_size is not None, "Either voxel_size or grid_size must be provided"
@@ -427,6 +429,7 @@ def blender_dump_to_volumetric_attr(
         'normals': [],
         'uvs': [],
         'material_ids': [],
+        'topology': [],
         'base_color_factor': [],
         'base_color_texture': [],
         'base_color_texture_filter': [],
@@ -600,6 +603,13 @@ def blender_dump_to_volumetric_attr(
         scene_buffers['normals'].append(normails)
         scene_buffers['uvs'].append(uvs)
         scene_buffers['material_ids'].append(material_id)
+        if multi_surface:
+            if dump.get('surface_normal_source') == GEOMETRY_NORMAL_SOURCE and 'topology' not in object:
+                raise ValueError('Canonical dump lacks triangle topology; regenerate with current dump_pbr.py')
+            topology = torch.as_tensor(object.get('topology', np.zeros(len(triangles), dtype=np.uint8)))
+            if topology.dtype != torch.uint8 or topology.shape != (len(triangles),):
+                raise ValueError('object topology must be uint8 [N_tri]')
+            scene_buffers['topology'].append(topology)
         
     scene_buffers['triangles'] = torch.cat(scene_buffers['triangles'], dim=0)   # [N, 3, 3]
     scene_buffers['normals'] = torch.cat(scene_buffers['normals'], dim=0)       # [N, 3, 3]
@@ -628,7 +638,9 @@ def blender_dump_to_volumetric_attr(
             
     # Voxelize. Multi-surface collection is a separate native entry point;
     # the legacy VXZ entry point and its result ordering stay unchanged.
-    native_fn = (_C.textured_mesh_to_volumetric_attr_multi_cpu if multi_surface
+    canonical = multi_surface and dump.get('surface_normal_source') == GEOMETRY_NORMAL_SOURCE
+    native_fn = (_C.textured_mesh_to_volumetric_attr_multi_topology_cpu if canonical else
+                 _C.textured_mesh_to_volumetric_attr_multi_cpu if multi_surface
                  else _C.textured_mesh_to_volumetric_attr_cpu)
     native_args = [
         voxel_size,
@@ -669,6 +681,8 @@ def blender_dump_to_volumetric_attr(
             int(max_records_per_voxel),
             int(max_total_records),
         ])
+        if canonical:
+            native_args.append(torch.cat(scene_buffers['topology']).contiguous())
     else:
         # Blender dump voxelization has never supplied a normal map for the
         # legacy VXZ path. Keep the old native signature intact while making
@@ -715,16 +729,39 @@ def blender_dump_to_volumetric_attr(
             base_color.detach().cpu().numpy()[None], dst_space='AgX Base sRGB'
         )[0])
     base_color = torch.clamp(base_color * 255, 0, 255).byte()
+    normal = torch.clamp((out_tuple[6] * 0.5 + 0.5) * 255, 0, 255).byte().reshape(-1, 3)
+    if canonical:
+        # Native records are grouped by XYZ already. O(N), no torch.unique
+        # sorting or unused full-PBR quantized buffers for the RGB-only schema.
+        return coord, {'base_color': base_color, 'normal': normal,
+                       'confidence': record_confidence(coord), 'topology': out_tuple[7]}
     attr = {
         "base_color": base_color,
         "metallic": torch.clamp(out_tuple[2] * 255, 0, 255).byte().reshape(-1, 1),
         "roughness": torch.clamp(out_tuple[3] * 255, 0, 255).byte().reshape(-1, 1),
         "emissive": torch.clamp(out_tuple[4] * 255, 0, 255).byte().reshape(-1, 3),
         "alpha": torch.clamp(out_tuple[5] * 255, 0, 255).byte().reshape(-1, 1),
-        "normal": torch.clamp((out_tuple[6] * 0.5 + 0.5) * 255, 0, 255).byte().reshape(-1, 3),
+        "normal": normal,
     }
-    
     return coord, attr
+
+
+def record_confidence(coord):
+    """Count final normal clusters per consecutive voxel and broadcast uint8 q.
+
+    q(1,2)=1; q(3)=.9; q(4)=.7; q(5)=.5; q(6)=.3; q(>=7)=.1.
+    Input must be grouped by XYZ, as produced by the native voxelizer/writer.
+    """
+    xyz = coord.detach().cpu().numpy()
+    if not len(xyz):
+        return torch.empty((0, 1), dtype=torch.uint8, device=coord.device)
+    starts = np.r_[0, 1 + np.flatnonzero(np.any(xyz[1:] != xyz[:-1], axis=1)), len(xyz)]
+    counts = np.diff(starts)
+    # Integer arithmetic avoids float rounding changing .9*255 by one level.
+    tenths = np.where(counts <= 2, 10, np.maximum(1, 15 - 2 * counts))
+    quantized = (tenths * 255 + 5) // 10
+    q = np.repeat(quantized.astype(np.uint8), counts).reshape(-1, 1)
+    return torch.from_numpy(q).to(coord.device)
 
 
 def blender_dump_to_volumetric_attr_multi(
@@ -741,10 +778,10 @@ def blender_dump_to_volumetric_attr_multi(
     all texture, alpha, emission, color-space, and mipmap behavior is shared
     with VXZ.  The output is suitable for :func:`o_voxel.io.write_vxzm`.
     """
-    if dump.get('surface_normal_source') != BLENDER_DUMP_SURFACE_NORMAL_SOURCE:
+    if dump.get('surface_normal_source') not in DUMP_NORMAL_SOURCES:
         raise ValueError(
             "VXZM requires a current Blender dump with world-space authored "
-            "corner normals; regenerate the GLB dump with dump_pbr.py"
+            "corner normals or canonical geometry normals; regenerate the GLB dump with dump_pbr.py"
         )
     kwargs['multi_surface'] = True
     kwargs['cluster_angle_degrees'] = cluster_angle_degrees

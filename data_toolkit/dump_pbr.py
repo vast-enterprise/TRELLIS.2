@@ -31,17 +31,20 @@ def _dump_pbr(file_path, metadatum, root):
         temp_path = os.path.join(tmp_dir, f'{sha256}.pickle')
         output_path = os.path.join(root, 'pbr_dumps', f'{sha256}.pickle')
         args = [
-            BLENDER_PATH, '-b', '-P', os.path.join(os.path.dirname(__file__), 'blender_script', 'dump_pbr.py'),
-            '--',
+            BLENDER_PATH, '-b', '--python-exit-code', '1',
+            '-P', os.path.join(os.path.dirname(__file__), 'blender_script', 'dump_pbr.py'), '--',
             '--object', os.path.expanduser(file_path),
-            '--output_path', os.path.expanduser(temp_path)
+            '--output_path', os.path.expanduser(temp_path),
+            '--renormal' if opt.renormal else '--no-renormal',
+            '--merge-distance', str(opt.merge_distance),
+            '--max-edge-faces', str(opt.max_edge_faces),
         ]
         if file_path.endswith('.blend'):
             args.insert(1, file_path)
         
-        call(args, stdout=DEVNULL, stderr=DEVNULL)
+        returncode = call(args, stdout=DEVNULL, stderr=DEVNULL)
         
-        if os.path.exists(temp_path):
+        if returncode == 0 and os.path.exists(temp_path):
             shutil.move(temp_path, output_path)
             return {'sha256': sha256, 'pbr_dumped': True}
         else:
@@ -66,6 +69,11 @@ if __name__ == '__main__':
                         help='Filter objects with aesthetic score lower than this value')
     parser.add_argument('--instances', type=str, default=None,
                         help='Instances to process')
+    parser.add_argument('--renormal', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--merge-distance', type=float, default=1e-7)
+    parser.add_argument('--max-edge-faces', type=int, default=0,
+                        help='0 allows multi-face edges; 2 strict; 3 allows triple junctions')
+    parser.add_argument('--force', action='store_true', help='Rebuild dumps, including old authored-normal caches')
     dataset_utils.add_args(parser)
     parser.add_argument('--rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
@@ -96,7 +104,7 @@ if __name__ == '__main__':
         metadata = metadata[metadata['local_path'].notna()]
         if opt.filter_low_aesthetic_score is not None:
             metadata = metadata[metadata['aesthetic_score'] >= opt.filter_low_aesthetic_score]
-        if 'pbr_dumped' in metadata.columns:
+        if 'pbr_dumped' in metadata.columns and not opt.force:
             metadata = metadata[metadata['pbr_dumped'] != True]
     else:
         if os.path.exists(opt.instances):
@@ -114,6 +122,8 @@ if __name__ == '__main__':
     # filter out objects that are already processed
     sha256_list = os.listdir(os.path.join(opt.pbr_dump_root, 'pbr_dumps'))
     sha256_list = [os.path.splitext(f)[0] for f in sha256_list if f.endswith('.pickle')]
+    if opt.force:
+        sha256_list = []
     for sha256 in sha256_list:
         records.append({'sha256': sha256, 'pbr_dumped': True})
     print(f'Found {len(sha256_list)} dumped PBRs')

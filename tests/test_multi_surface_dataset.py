@@ -24,15 +24,14 @@ def main():
         coord = torch.tensor([[0, 0, 0], [0, 0, 0], [7, 7, 7]], dtype=torch.int32)
         attr = {
             "base_color": torch.tensor([[255, 0, 0], [0, 255, 0], [0, 0, 255]], dtype=torch.uint8),
-            "metallic": torch.zeros((3, 1), dtype=torch.uint8),
-            "roughness": torch.full((3, 1), 255, dtype=torch.uint8),
-            "alpha": torch.full((3, 1), 255, dtype=torch.uint8),
+            "confidence": torch.full((3, 1), 255, dtype=torch.uint8),
             "normal": torch.tensor([[127, 127, 255], [127, 127, 0], [255, 127, 127]], dtype=torch.uint8),
+            "topology": torch.tensor([[1], [0], [0]], dtype=torch.uint8),
         }
         for index in range(2):
             o_voxel.io.write_vxzm(root / f"sample{index}.vxzm", coord, attr,
                                    grid_size=8, region_resolution=4,
-                                   compression="none")
+                                   compression="none", normal_source="geometry_reoriented_face_v1")
         pd.DataFrame([
             {"sha256": "sample0", "pbrm_voxelized": True, "num_pbrm_records": 3},
             {"sha256": "sample1", "pbrm_voxelized": True, "num_pbrm_records": 3},
@@ -53,6 +52,8 @@ def main():
         assert batch["region_offsets"].tolist()[-1] == len(batch["region_coord"])
         assert batch["region_record_offsets"].tolist()[-1] == 6
         assert len(batch["coord"]) == len(batch["feats"]) == 6
+        assert batch['feats'].shape[1] == 7
+        assert batch['attr']['topology'][:,0].tolist() == [1,0,0,1,0,0]
         assert torch.equal(batch["attr"]["normal"][:2], sample["attr"]["normal"][:2])
     print("multi-surface VXZM dataset test passed")
 

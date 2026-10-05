@@ -69,6 +69,8 @@ def main():
         dump = pickle.load(f)
 
     import o_voxel
+    from create_vxz import normalize_dump_geometry
+    normalize_dump_geometry(dump)
     coord, attr = o_voxel.convert.blender_dump_to_volumetric_attr_multi(
         dump, grid_size=args.resolution,
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
@@ -79,6 +81,7 @@ def main():
     )
     o_voxel.io.write_vxzm(vxzm_path, coord, attr, grid_size=args.resolution,
                            region_resolution=args.region_resolution,
+                           normal_source="geometry_reoriented_face_v1",
                            metadata={
                                "cluster_angle_degrees": args.cluster_angle_degrees,
                                "color_space": args.color_space,

@@ -23,7 +23,7 @@ from data_toolkit import build_metadata
 
 def fixture_dump():
     return {
-        "surface_normal_source": "blender_authored_corner_world_v1",
+        "surface_normal_source": "blender_geometry_reoriented_face_world_v1",
         "materials": [{
             "baseColorFactor": [0.25, 0.5, 0.75, 1.0],
             "baseColorTexture": None,
@@ -48,6 +48,7 @@ def fixture_dump():
             "normals": np.asarray([[[0.0, 0.0, 1.0]] * 3], dtype=np.float32),
             "uvs": np.zeros((1, 3, 2), dtype=np.float32),
             "mat_ids": np.asarray([0], dtype=np.int32),
+            "topology": np.zeros(1, dtype=np.uint8),
         }],
     }
 
@@ -97,9 +98,9 @@ def main():
         info = o_voxel.io.read_vxzm_info(vxzm)
         assert info["num_records"] >= info["num_unique_voxels"] > 0
         assert info["region_block_size"] == [2, 2, 2]
-        assert info["normal_source"] == "surface_authored_with_winding_guard"
+        assert info["normal_source"] == "geometry_reoriented_face_v1"
         assert {entry["name"] for entry in info["record_layout"]} == {
-            "base_color", "metallic", "roughness", "emissive", "alpha", "normal",
+            "base_color", "normal", "confidence", "topology",
         }
         assert result["pbrm_config_8"] == voxelize_pbr._expected_vxzm_config(8)
         assert voxelize_pbr._vxzm_config_from_info(info) is not None
@@ -109,7 +110,7 @@ def main():
         old_layout_info = dict(info)
         old_layout_info["record_layout"] = [
             entry for entry in info["record_layout"]
-            if entry["name"] != "emissive"
+            if entry["name"] != "confidence"
         ]
         assert voxelize_pbr._vxzm_config_from_info(old_layout_info) != \
             voxelize_pbr._expected_vxzm_config(8)

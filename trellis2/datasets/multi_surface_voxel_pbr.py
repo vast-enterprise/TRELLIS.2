@@ -25,6 +25,11 @@ class MultiSurfaceVoxelPbrDataset(StandardDatasetBase):
     collate function concatenates records and exposes offsets for both samples
     and regions, so downstream models can choose their own multi-surface
     representation without losing information.
+
+    ``topology`` remains in raw ``attr`` and is not a default neural input.
+    Decode query confidence from ``attr['confidence'].float()/255`` and
+    renormalize decoded normals; generic ``feats`` scales all selected bytes
+    to [-1,1] for compatibility and must not be used as loss weights directly.
     """
 
     def __init__(
@@ -41,7 +46,7 @@ class MultiSurfaceVoxelPbrDataset(StandardDatasetBase):
         self.max_num_faces = max_num_faces
         self.min_aesthetic_score = min_aesthetic_score
         self.attrs = (list(attrs) if attrs is not None else
-                      ["base_color", "metallic", "roughness", "alpha", "normal"])
+                      ["base_color", "normal", "confidence"])
         if not self.attrs:
             raise ValueError("attrs must contain at least one VXZM attribute")
         super().__init__(roots)

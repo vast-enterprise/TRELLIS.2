@@ -13,15 +13,11 @@ from functools import partial
 import o_voxel
 
 
-VXZM_NORMAL_SOURCE = 'surface_authored_with_winding_guard'
-VXZM_RECORD_LAYOUT = [
-    ['base_color', 3],
-    ['metallic', 1],
-    ['roughness', 1],
-    ['emissive', 3],
-    ['alpha', 1],
-    ['normal', 3],
-]
+VXZM_NORMAL_SOURCE = 'geometry_reoriented_face_v1'
+VXZM_RECORD_LAYOUT = [['base_color', 3], ['normal', 3], ['confidence', 1], ['topology', 1]]
+VXZM_CONFIDENCE_SOURCE = 'cluster_count_v1'
+VXZM_MERGE_WEIGHT = 'closest_point_gaussian_voxel_v1'
+VXZM_TOPOLOGY_SOURCE = 'source_triangle_multi_face_edge_v1'
 
 
 def _expected_vxzm_config(resolution):
@@ -31,6 +27,9 @@ def _expected_vxzm_config(resolution):
         'region_resolution': int(opt.region_resolution),
         'normal_source': VXZM_NORMAL_SOURCE,
         'record_layout': VXZM_RECORD_LAYOUT,
+        'confidence_source': VXZM_CONFIDENCE_SOURCE,
+        'merge_weight': VXZM_MERGE_WEIGHT,
+        'topology_source': VXZM_TOPOLOGY_SOURCE,
         'color_space': opt.color_space,
         'add_emission': bool(opt.add_emission),
         'cluster_angle_degrees': float(opt.cluster_angle_degrees),
@@ -57,6 +56,9 @@ def _vxzm_config_from_info(info):
             'region_resolution': int(info['region_resolution']),
             'normal_source': info['normal_source'],
             'record_layout': record_layout,
+            'confidence_source': metadata['confidence_source'],
+            'merge_weight': metadata['merge_weight'],
+            'topology_source': metadata['topology_source'],
             'color_space': metadata['color_space'],
             'add_emission': add_emission,
             'cluster_angle_degrees': float(metadata['cluster_angle_degrees']),
@@ -213,24 +215,25 @@ def _pbr_voxelize(file, metadatum, pbr_dump_root, root):
                     pack[f'pbr_voxelized_{res}'] = True
                     pack[f'num_pbr_voxels_{res}'] = len(coord)
                 if want_vxzm and not vxzm_ok:
+                    if dump.get('surface_normal_source') != 'blender_geometry_reoriented_face_world_v1':
+                        raise ValueError('VXZM v1 requires re-normal dump; regenerate with dump_pbr.py')
                     coord, attr = o_voxel.convert.blender_dump_to_volumetric_attr_multi(
                         dump, cluster_angle_degrees=opt.cluster_angle_degrees,
                         max_records_per_voxel=opt.max_records_per_voxel,
                         max_total_records=opt.max_total_records, **common)
-                    # Keep the full PBR record in VXZM. ``base_color`` already
-                    # contains emission when add_emission is enabled, while
-                    # the separate emissive field remains useful for debugging
-                    # and future consumers. The default training feature list
-                    # intentionally omits it, so current supervision is
-                    # unchanged. Legacy VXZ retains its historical layout.
                     o_voxel.io.write_vxzm(vxzm_path, coord, attr, grid_size=res,
                                            region_resolution=opt.region_resolution,
+                                           normal_source=VXZM_NORMAL_SOURCE,
                                            metadata={
                                                'cluster_angle_degrees': opt.cluster_angle_degrees,
                                                'color_space': opt.color_space,
                                                'add_emission': opt.add_emission,
                                                'max_records_per_voxel': opt.max_records_per_voxel,
                                                'max_total_records': opt.max_total_records,
+                                               'confidence_source': VXZM_CONFIDENCE_SOURCE,
+                                               'merge_weight': VXZM_MERGE_WEIGHT,
+                                               'topology_source': VXZM_TOPOLOGY_SOURCE,
+                                               'normal_preprocessing': dump.get('normal_preprocessing', {}),
                                            })
                     info = o_voxel.io.read_vxzm_info(vxzm_path)
                     pack[f'pbrm_voxelized_{res}'] = True

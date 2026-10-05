@@ -84,7 +84,6 @@ def _mesh_from_dump(dump: Dict[str, Any]) -> Tuple["torch.Tensor", "torch.Tensor
     import torch
 
     _pbr.normalize_dump_geometry(dump)
-
     vertices = []
     faces = []
     start = 0
@@ -270,6 +269,12 @@ def _convert_pbr_attributes(dump: Dict[str, Any], args: argparse.Namespace):
     # convert_geometry() applies this same in-place, idempotent transform.
     # Whichever conversion runs first therefore establishes one shared frame.
     _pbr.normalize_dump_geometry(dump)
+    args.vxzm_normal_source = (
+        'geometry_reoriented_face_v1'
+        if dump.get('surface_normal_source') == 'blender_geometry_reoriented_face_world_v1'
+        else 'surface_authored_with_winding_guard'
+    )
+    args.normal_preprocessing = dump.get('normal_preprocessing', {})
 
     common = {
         "grid_size": args.resolution,
@@ -312,7 +317,14 @@ def _write_pbr(path: Path, coord: "torch.Tensor", attr: Dict[str, "torch.Tensor"
             region_resolution=args.region_resolution,
             compression=compression,
             compression_level=args.compression_level,
-            metadata=_pbr._write_metadata(args),
+            normal_source=args.vxzm_normal_source,
+            metadata={**_pbr._write_metadata(args),
+                      'normal_preprocessing': args.normal_preprocessing,
+                      'merge_weight': 'closest_point_gaussian_voxel_v1',
+                      **({'topology_source': 'source_triangle_multi_face_edge_v1'}
+                         if 'topology' in attr else {}),
+                      **({'confidence_source': 'cluster_count_v1'}
+                         if 'confidence' in attr else {})},
         )
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError(f"PBR writer did not produce {path}")

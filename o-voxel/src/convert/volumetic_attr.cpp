@@ -10,6 +10,8 @@
 
 #include "api.h"
 
+static thread_local const uint8_t* g_triangle_topology = nullptr;
+static thread_local std::vector<uint8_t>* g_record_topology = nullptr;
 static thread_local bool g_multi_surface = false;
 static thread_local float g_multi_surface_cluster_angle = 15.0f;
 static thread_local int64_t g_multi_surface_max_records_per_voxel = 0;
@@ -53,6 +55,7 @@ struct MultiSurfaceSample {
     float alpha;
     Eigen::Vector3f clusterNormal;
     Eigen::Vector3f geometricNormal;
+    uint8_t topology;
 };
 
 // Hash function for VoxelCoord to use in unordered_map
@@ -649,6 +652,17 @@ voxelize_trimesh_pbr_impl(
                 barycentric.x() * n0.z() + barycentric.y() * n1.z() + barycentric.z() * n2.z()
             };
             float weight = 1 - barycentric.w();
+            if (multiSurface) {
+                // Symmetric nonnegative footprint, reusing the closest point
+                // already computed for UV. No extra triangle query or area
+                // factor (which would bias different triangulations).
+                const Eigen::Vector3f closest = uv_barycentric.x() * v0 +
+                    uv_barycentric.y() * v1 + uv_barycentric.z() * v2;
+                const Eigen::Vector3f center((x + 0.5f) * delta_p.x(),
+                    (y + 0.5f) * delta_p.y(), (z + 0.5f) * delta_p.z());
+                const float d2 = ((center - closest).cwiseQuotient(delta_p)).squaredNorm();
+                weight = std::max(std::exp(-0.5f * d2), 1e-8f);
+            }
 
             /// base color
             float baseColor[3] = {1, 1, 1};
@@ -777,7 +791,7 @@ voxelize_trimesh_pbr_impl(
                     Eigen::Vector3f(baseColor[0], baseColor[1], baseColor[2]),
                     metallic, roughness,
                     Eigen::Vector3f(emissive[0], emissive[1], emissive[2]),
-                    alpha, surface_n, n
+                    alpha, surface_n, n, g_triangle_topology ? g_triangle_topology[tid] : uint8_t(0)
                 });
                 continue;
             }
@@ -881,6 +895,7 @@ voxelize_trimesh_pbr_impl(
                         "Multi-surface output exceeds max_total_records=", maxTotalRecords
                     );
                     const size_t output_idx = coords.size();
+                    if (g_record_topology) g_record_topology->push_back(sample.topology);
                     cluster_indices.push_back(output_idx);
                     cluster_members.push_back({sample.clusterNormal});
                     cluster_geometric_members.push_back({sample.geometricNormal});
@@ -896,6 +911,7 @@ voxelize_trimesh_pbr_impl(
                     buf_normals.push_back(sample.clusterNormal * sample.weight);
                 } else {
                     const size_t output_idx = cluster_indices[selected_local];
+                    if (g_record_topology) (*g_record_topology)[output_idx] |= sample.topology;
                     cluster_members[selected_local].push_back(sample.clusterNormal);
                     cluster_geometric_members[selected_local].push_back(sample.geometricNormal);
                     buf_weights[output_idx] += sample.weight;
@@ -1358,4 +1374,73 @@ textured_mesh_to_volumetric_attr_multi_cpu(
         noNormalTexture, noNormalTextureFilter, noNormalTextureWrap,
         mipLevelOffset, timing, addEmission
     );
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+textured_mesh_to_volumetric_attr_multi_topology_cpu(
+    const torch::Tensor& voxel_size,
+    const torch::Tensor& grid_range,
+    const torch::Tensor& vertices,
+    const torch::Tensor& normals,
+    const torch::Tensor& uvs,
+    const torch::Tensor& materialIds,
+    const std::vector<torch::Tensor>& baseColorFactor,
+    const std::vector<torch::Tensor>& baseColorTexture,
+    const std::vector<int>& baseColorTextureFilter,
+    const std::vector<int>& baseColorTextureWrap,
+    const std::vector<float>& metallicFactor,
+    const std::vector<torch::Tensor>& metallicTexture,
+    const std::vector<int>& metallicTextureFilter,
+    const std::vector<int>& metallicTextureWrap,
+    const std::vector<float>& roughnessFactor,
+    const std::vector<torch::Tensor>& roughnessTexture,
+    const std::vector<int>& roughnessTextureFilter,
+    const std::vector<int>& roughnessTextureWrap,
+    const std::vector<torch::Tensor>& emissiveFactor,
+    const std::vector<torch::Tensor>& emissiveTexture,
+    const std::vector<int>& emissiveTextureFilter,
+    const std::vector<int>& emissiveTextureWrap,
+    const std::vector<int>& alphaMode,
+    const std::vector<float>& alphaCutoff,
+    const std::vector<float>& alphaFactor,
+    const std::vector<torch::Tensor>& alphaTexture,
+    const std::vector<int>& alphaTextureFilter,
+    const std::vector<int>& alphaTextureWrap,
+    const float mipLevelOffset,
+    const bool timing,
+    const bool addEmission,
+    const float clusterAngleDegrees,
+    const int64_t maxRecordsPerVoxel,
+    const int64_t maxTotalRecords,
+    const torch::Tensor& triangleTopology
+) {
+    TORCH_CHECK(triangleTopology.device().is_cpu() && triangleTopology.scalar_type() == torch::kUInt8 &&
+                triangleTopology.dim() == 1 && triangleTopology.size(0) == vertices.size(0),
+                "triangleTopology must be CPU uint8 [N_tri]");
+    auto topology = triangleTopology.contiguous();
+    std::vector<uint8_t> recordTopology;
+    struct TopologyGuard {
+        const uint8_t* previousInput = g_triangle_topology;
+        std::vector<uint8_t>* previousOutput = g_record_topology;
+        TopologyGuard(const uint8_t* input, std::vector<uint8_t>* output) {
+            g_triangle_topology = input;
+            g_record_topology = output;
+        }
+        ~TopologyGuard() {
+            g_triangle_topology = previousInput;
+            g_record_topology = previousOutput;
+        }
+    } guard(topology.data_ptr<uint8_t>(), &recordTopology);
+    auto result = textured_mesh_to_volumetric_attr_multi_cpu(
+        voxel_size, grid_range, vertices, normals, uvs, materialIds,
+        baseColorFactor, baseColorTexture, baseColorTextureFilter, baseColorTextureWrap,
+        metallicFactor, metallicTexture, metallicTextureFilter, metallicTextureWrap,
+        roughnessFactor, roughnessTexture, roughnessTextureFilter, roughnessTextureWrap,
+        emissiveFactor, emissiveTexture, emissiveTextureFilter, emissiveTextureWrap,
+        alphaMode, alphaCutoff, alphaFactor, alphaTexture, alphaTextureFilter, alphaTextureWrap,
+        mipLevelOffset, timing, addEmission, clusterAngleDegrees, maxRecordsPerVoxel, maxTotalRecords);
+    auto flags = torch::empty({static_cast<int64_t>(recordTopology.size()), 1}, torch::kUInt8);
+    std::copy(recordTopology.begin(), recordTopology.end(), flags.data_ptr<uint8_t>());
+    return std::tuple_cat(result, std::make_tuple(flags));
 }
