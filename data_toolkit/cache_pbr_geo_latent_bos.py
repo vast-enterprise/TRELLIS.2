@@ -2,7 +2,8 @@
 """Cache paired geometry/texture VXZs from BOS as {coords, latents_geo, latents}.
 
 First run download_latent_models.py to populate .hf_models/ckpts.
-The BOS upload prefix is intentionally None; set --latent-folder manually.
+The BOS upload bucket and prefix are None; set --upload-bucket and
+--latent-folder manually. The input bucket is configured separately.
 Use --no-upload to retain local latents for inspection without any BOS writes.
 Material channels are zeroed after normalization, matching the local script.
 """
@@ -20,7 +21,7 @@ sys.path.insert(0, str(ROOT / 'o-voxel'))
 import torch
 import torch.multiprocessing as mp
 from data_toolkit.cache_pbr_latent_bos import (
-    DEFAULT_BUCKET, DEFAULT_ATTRS, read_uuid_list, load_encoder,
+    DEFAULT_ATTRS, read_uuid_list, load_encoder,
     _make_bos_client, bos_key, bos_object_exists, download_bos_file,
     upload_bos_file, _env_first, _choose_gpus, _clear_cuda_after_error,
 )
@@ -28,6 +29,8 @@ from data_toolkit.cache_pbr_geo_latent_local import (
     DEFAULT_PBR_ENCODER, DEFAULT_GEO_ENCODER, _read_pbr, _read_geometry,
     _encode_pbr, _encode_geometry, _offload_encoder, _release_cuda,
 )
+DEFAULT_INPUT_BUCKET = 'texture-surface-sample'
+DEFAULT_UPLOAD_BUCKET = None  # Must be filled in manually before uploading.
 DEFAULT_TEXTURE_FOLDER = 'sample_vxz_2048/texture'
 DEFAULT_GEOMETRY_FOLDER = 'sample_vxz_2048/geometry'
 DEFAULT_LATENT_FOLDER = None  # Must be filled in manually before uploading.
@@ -70,7 +73,7 @@ def _worker(worker_id: int, gpu_id: int, task_queue: Any, result_queue: Any,
             pbr = vertices = intersected = None
             pbr_pack = geo_pack = pack = None
             try:
-                if options['upload'] and options['skip_existing'] and bos_object_exists(client, options['bucket'], output_key):
+                if options['upload'] and options['skip_existing'] and bos_object_exists(client, options['upload_bucket'], output_key):
                     result_queue.put((sample, 'skipped', 0.0, 'output already exists'))
                     break
                 for folder, destination in ((options['texture_vxz_folder'], texture_path),
@@ -127,7 +130,7 @@ def _worker(worker_id: int, gpu_id: int, task_queue: Any, result_queue: Any,
                 torch.save(pack, tmp_path)
                 os.replace(tmp_path, output_path)
                 if options["upload"]:
-                    upload_bos_file(client, options["bucket"], output_key, output_path)
+                    upload_bos_file(client, options["upload_bucket"], output_key, output_path)
                     # Only remove the cache after the upload command succeeds.
                     output_path.unlink()
                 action = "uploaded; local cache removed" if options["upload"] else "saved"
@@ -193,7 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default=".cache_pbr_geo_latents_bos/output")
     p.add_argument("--failed-uuids", default=".cache_pbr_geo_latents_bos/failed.txt")
     p.add_argument("--retries", type=int, default=1)
-    p.add_argument('--bucket', default=DEFAULT_BUCKET)
+    p.add_argument('--bucket', default=DEFAULT_INPUT_BUCKET, help='Input VXZ bucket only')
+    p.add_argument('--upload-bucket', default=DEFAULT_UPLOAD_BUCKET, help='Output bucket; must be set manually')
     p.add_argument('--latent-folder', default=DEFAULT_LATENT_FOLDER)
     p.add_argument('--keep-inputs', action='store_true', help='Retain downloaded VXZs for reconstruction checks')
     p.add_argument('--no-skip-existing', dest='skip_existing', action='store_false')
@@ -219,8 +223,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.upload and (not args.latent_folder or args.latent_folder.strip().lower() in ('none', '/', '')):
-        parser.error('Upload destination is None. Set --latent-folder manually or use --no-upload.')
+    if args.upload and any(
+        value is None or value.strip().lower() in ('none', '/', '')
+        for value in (args.upload_bucket, args.latent_folder)
+    ):
+        parser.error('Upload bucket/folder is None. Set --upload-bucket and --latent-folder manually or use --no-upload.')
     if tuple(args.attrs) != DEFAULT_ATTRS:
         parser.error('Official texture checkpoints require base_color metallic roughness alpha channel order')
     uuids = read_uuid_list(args.uuid_list)
