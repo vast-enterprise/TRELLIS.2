@@ -22,13 +22,23 @@ The default BOS upload layout is::
     <upload-folder>/geometry/<uuid[:2]>/<uuid>.vxz
 
 The input GLB layout is the same as ``create_vxz.py`` (``--bos-folder`` plus
-``<uuid[:2]>/<uuid>.glb``).
+``<uuid[:2]>/<uuid>.glb``), unless ``--bos-uri`` is supplied.  That option is
+an exact BOS object key relative to ``--bos-bucket`` and is useful for assets
+whose object key is not derived from the UUID.
+
+Mesh orientation can be changed after the Blender dump and before both
+voxelizers.  For example, ``--flip-front-back`` applies a 180-degree turn
+around Blender's +Z, rotating mesh vertices and normals together. Arbitrary
+XYZ angles are available through ``--rotation-degrees``. The local GLB entry
+``create_geo_pbr_local.py`` shares this pipeline and needs BOS credentials only
+for upload. ``--pkl-only`` saves the transformed dump without voxelization.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import pickle
 import posixpath
 import sys
 from pathlib import Path
@@ -59,6 +69,144 @@ if str(OVOXEL_ROOT) not in sys.path:
 
 DEFAULT_OUTPUT_DIR = Path("./geo_pbr_outputs")
 DEFAULT_UPLOAD_FOLDER = "sample_vxz"
+
+# ``dump_pbr.py`` stores evaluated mesh data after applying each object's
+# ``matrix_world``.  Those coordinates are therefore in Blender's world
+# frame, whose up axis is +Z.  Keep the marker private so old pickle dumps
+# remain readable while making the convention explicit in this pipeline.
+_DUMP_COORDINATE_SYSTEM_KEY = "_trellis2_coordinate_system"
+_DUMP_COORDINATE_SYSTEM = "blender_world_z_up"
+_DUMP_ROTATION_KEY = "_trellis2_rotation_degrees_xyz"
+
+
+def _ensure_blender_z_up_dump(dump: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and annotate the coordinate frame emitted by dump_pbr.py."""
+    if not isinstance(dump, dict):
+        raise TypeError(f"PBR dump must be a dictionary, got {type(dump).__name__}")
+    declared = dump.get("coordinate_system", dump.get(_DUMP_COORDINATE_SYSTEM_KEY))
+    if declared is not None and declared != _DUMP_COORDINATE_SYSTEM:
+        raise ValueError(
+            "Blender PBR dump is not in the expected Z-up world frame: "
+            f"coordinate_system={declared!r}"
+        )
+    dump[_DUMP_COORDINATE_SYSTEM_KEY] = _DUMP_COORDINATE_SYSTEM
+    return dump
+
+
+def _rotation_matrix_xyz(rotation_degrees: Tuple[float, float, float]):
+    """Return a right-handed XYZ Euler rotation matrix.
+
+    The rotations are applied in X, then Y, then Z order (``Rz @ Ry @ Rx``),
+    which is unambiguous for the common ``(0, 0, 180)`` front/back flip.
+    Angles are expressed in degrees to match the command-line interface.
+    """
+    import numpy as np
+
+    angles = np.asarray(rotation_degrees, dtype=np.float64)
+    if angles.shape != (3,) or not np.isfinite(angles).all():
+        raise ValueError("rotation_degrees must contain three finite values")
+    rx, ry, rz = np.deg2rad(angles)
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    rx_matrix = np.asarray([[1.0, 0.0, 0.0],
+                            [0.0, cx, -sx],
+                            [0.0, sx, cx]])
+    ry_matrix = np.asarray([[cy, 0.0, sy],
+                            [0.0, 1.0, 0.0],
+                            [-sy, 0.0, cy]])
+    rz_matrix = np.asarray([[cz, -sz, 0.0],
+                            [sz, cz, 0.0],
+                            [0.0, 0.0, 1.0]])
+    return rz_matrix @ ry_matrix @ rx_matrix
+
+
+def rotate_dump_geometry(
+    dump: Dict[str, Any],
+    rotation_degrees: Tuple[float, float, float] | list[float],
+    *,
+    center: Tuple[float, float, float] | list[float] = (0.0, 0.0, 0.0),
+) -> Dict[str, Any]:
+    """Rotate Blender-dump mesh vertices and corner normals in place.
+
+    ``dump_pbr.py`` emits world-space vertices and world-space corner normals.
+    Consequently both arrays must receive the same proper (determinant +1)
+    rotation; rotating only vertices would leave PBR normal attributes in the
+    old frame.  The default center is the origin because Blender's dump first
+    centers the normalized scene there.  A private cumulative marker records
+    the applied angles for reproducibility/debugging.
+
+    Args:
+        dump: Blender PBR pickle dictionary.
+        rotation_degrees: ``(x, y, z)`` right-handed Euler angles in degrees.
+        center: Point about which to rotate, in dump/world coordinates.
+    """
+    import numpy as np
+
+    if not isinstance(dump, dict):
+        raise TypeError(f"PBR dump must be a dictionary, got {type(dump).__name__}")
+    _ensure_blender_z_up_dump(dump)
+    angles = np.asarray(rotation_degrees, dtype=np.float64)
+    if angles.shape != (3,) or not np.isfinite(angles).all():
+        raise ValueError("rotation_degrees must contain three finite values")
+    pivot = np.asarray(center, dtype=np.float64)
+    if pivot.shape != (3,) or not np.isfinite(pivot).all():
+        raise ValueError("center must contain three finite values")
+    if np.allclose(angles, 0.0):
+        # Mark the known frame even for the default no-op.  This is useful for
+        # callers inspecting a dump after the pipeline has loaded it.
+        dump.setdefault(_DUMP_COORDINATE_SYSTEM_KEY, _DUMP_COORDINATE_SYSTEM)
+        dump.setdefault(_DUMP_ROTATION_KEY, (0.0, 0.0, 0.0))
+        return dump
+
+    objects = dump.get("objects")
+    if not isinstance(objects, (list, tuple)) or not objects:
+        raise ValueError("PBR dump contains no mesh objects")
+    matrix = _rotation_matrix_xyz(tuple(float(value) for value in angles))
+    for index, obj in enumerate(objects):
+        if not isinstance(obj, dict):
+            raise ValueError(f"object {index} is not a dictionary")
+        raw_vertices = obj.get("vertices")
+        if raw_vertices is None:
+            continue
+        vertices = np.asarray(raw_vertices)
+        if vertices.size == 0:
+            continue
+        if vertices.ndim != 2 or vertices.shape[1] != 3:
+            raise ValueError(f"object {index} has invalid vertices shape {vertices.shape}")
+        if not np.isfinite(vertices).all():
+            raise ValueError(f"object {index} contains non-finite vertices")
+        vertices64 = vertices.astype(np.float64, copy=False)
+        # Dumps produced by Blender use float32.  Normalize the output dtype
+        # as well so a hand-created integer fixture cannot silently truncate a
+        # rotated coordinate.
+        obj["vertices"] = ((vertices64 - pivot) @ matrix.T + pivot).astype(
+            np.float32, copy=False
+        )
+
+        raw_normals = obj.get("normals")
+        if raw_normals is None:
+            continue
+        normals = np.asarray(raw_normals)
+        if normals.size == 0:
+            continue
+        if normals.ndim == 0 or normals.shape[-1] != 3 or not np.isfinite(normals).all():
+            raise ValueError(f"object {index} has invalid normals shape {normals.shape}")
+        # A proper rotation does not require inverse-transpose handling, and
+        # preserving the original shape supports both (F, 3, 3) and flattened
+        # normal arrays found in older dumps.
+        normals64 = normals.astype(np.float64, copy=False).reshape(-1, 3)
+        obj["normals"] = (normals64 @ matrix.T).reshape(normals.shape).astype(
+            np.float32, copy=False
+        )
+
+    dump[_DUMP_COORDINATE_SYSTEM_KEY] = _DUMP_COORDINATE_SYSTEM
+    dump.setdefault("coordinate_system", _DUMP_COORDINATE_SYSTEM)
+    previous = np.asarray(dump.get(_DUMP_ROTATION_KEY, (0.0, 0.0, 0.0)), dtype=np.float64)
+    if previous.shape != (3,) or not np.isfinite(previous).all():
+        previous = np.zeros(3, dtype=np.float64)
+    dump[_DUMP_ROTATION_KEY] = tuple(float(value) for value in (previous + angles))
+    return dump
 
 
 def _grid_size(value: int | Tuple[int, int, int] | list[int]) -> int | list[int]:
@@ -275,6 +423,8 @@ def _convert_pbr_attributes(dump: Dict[str, Any], args: argparse.Namespace):
         else 'surface_authored_with_winding_guard'
     )
     args.normal_preprocessing = dump.get('normal_preprocessing', {})
+    args.vxzm_mesh = (o_voxel.convert.mesh_from_dump(dump)
+                      if getattr(args, 'store_mesh', False) else None)
 
     common = {
         "grid_size": args.resolution,
@@ -318,6 +468,8 @@ def _write_pbr(path: Path, coord: "torch.Tensor", attr: Dict[str, "torch.Tensor"
             compression=compression,
             compression_level=args.compression_level,
             normal_source=args.vxzm_normal_source,
+            **(dict(mesh_vertices=args.vxzm_mesh[0], mesh_faces=args.vxzm_mesh[1])
+               if getattr(args, 'vxzm_mesh', None) is not None else {}),
             metadata={**_pbr._write_metadata(args),
                       'normal_preprocessing': args.normal_preprocessing,
                       'merge_weight': 'closest_point_gaussian_voxel_v1',
@@ -362,8 +514,50 @@ def _default_geometry_upload_key(folder: str, uuid: str) -> str:
     return posixpath.join(folder.strip("/"), uuid[:2], name) if folder.strip("/") else posixpath.join(uuid[:2], name)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _validate_bos_uri(value: str) -> str:
+    """Validate an explicit BOS object key without changing its spelling."""
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("bos URI must not be empty")
+    if "\x00" in value:
+        raise argparse.ArgumentTypeError("bos URI must not contain NUL bytes")
+    return value
+
+
+def _download_input_glb(
+    client: Any,
+    bucket: str,
+    folder: str,
+    uuid: str,
+    destination: Path,
+    bos_uri: Optional[str] = None,
+) -> str:
+    """Download the input GLB, optionally using an explicit BOS object key.
+
+    The default path intentionally delegates to :func:`create_vxz.download_glb`
+    so the historical UUID-derived layout remains unchanged.  An explicit
+    URI only changes the source object key; the local cache filename continues
+    to be based on ``uuid`` and therefore does not affect output or upload
+    naming.
+    """
+    if bos_uri is None:
+        return download_glb(client, bucket, folder, uuid, destination)
+    key = _validate_bos_uri(bos_uri)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading bos://{bucket}/{key} -> {destination}")
+    client.get_object_to_file(bucket, key, str(destination))
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError(f"BOS download produced no data: {destination}")
+    return key
+
+
+def build_parser(*, local: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    if local:
+        parser.description = 'Create aligned geometry/PBR voxels or a rotated PBR dump from a local GLB.'
+        parser.add_argument('--glb', type=Path, required=True, help='Local GLB input; never removed by cleanup')
+    else:
+        parser.set_defaults(glb=None)
     parser.add_argument("uuid", nargs="?", type=_pbr._validate_uuid)
     parser.add_argument("--uuid", dest="uuid_option", type=_pbr._validate_uuid)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -371,6 +565,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None, help="Local PBR output path")
     parser.add_argument("--geometry-output", type=Path, default=None, help="Local dual-grid VXZ path")
     parser.add_argument("--blender", default="blender")
+    parser.add_argument('--rotation-degrees', '--rotation', dest='rotation_degrees',
+                        nargs=3, type=float, metavar=('X', 'Y', 'Z'), default=(0.0, 0.0, 0.0),
+                        help='Rotate vertices and normals in XYZ order before both voxelizers (degrees)')
+    parser.add_argument('--pkl-only', action='store_true',
+                        help='Save the rotated Blender dump; skip voxelization and upload')
+    parser.add_argument(
+        "--flip-front-back", action="store_true",
+        help="Rotate mesh vertices and normals 180 degrees around Blender's +Z before both voxelizers",
+    )
     parser.add_argument("--resolution", type=int, default=1024)
     parser.add_argument("--geometry-resolution", type=int, default=None,
                         help="Dual-grid resolution (default: --resolution)")
@@ -380,6 +583,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="PBR container format (geometry is always VXZ)",
     )
     parser.add_argument("--region-resolution", type=int, default=256)
+    parser.add_argument('--store-mesh', action=argparse.BooleanOptionalAction, default=False,
+                        help='Include normalized scene mesh in texture VXZM (default: off)')
     parser.add_argument("--cluster-angle-degrees", type=float, default=15.0)
     parser.add_argument("--max-records-per-voxel", type=_pbr._non_negative_int, default=0)
     parser.add_argument("--max-total-records", type=_pbr._non_negative_int, default=0)
@@ -406,6 +611,13 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.getenv("BOS_INPUT_BUCKET", _pbr.DEFAULT_INPUT_BUCKET))
     parser.add_argument("--bos-folder", "--input-folder", dest="bos_folder",
                         default=os.getenv("BOS_INPUT_FOLDER", _pbr.DEFAULT_INPUT_FOLDER))
+    parser.add_argument(
+        "--bos-uri",
+        type=_validate_bos_uri,
+        default=None,
+        help=("Exact input GLB object key in --bos-bucket; overrides the "
+              "UUID-derived --bos-folder/<uuid[:2]>/<uuid>.glb path"),
+    )
     parser.add_argument("--bos-access-key-id", default=os.getenv("BOS_ACCESS_KEY_ID", ""), help=argparse.SUPPRESS)
     parser.add_argument(
         "--bos-secret-access-key",
@@ -427,6 +639,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _parse_args(parser: argparse.ArgumentParser, argv: Optional[list[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
+    if args.pkl_only and (args.upload or args.visualize or args.store_mesh):
+        parser.error('--pkl-only cannot be combined with --upload, --visualize or --store-mesh')
+    if args.store_mesh and (args.output_format != 'vxzm' or args.visualize):
+        parser.error('--store-mesh requires VXZM output (without --visualize)')
+    import math
+    if not all(math.isfinite(value) for value in args.rotation_degrees):
+        parser.error('--rotation-degrees must contain finite angles')
+    if args.flip_front_back:
+        if any(value != 0.0 for value in args.rotation_degrees):
+            parser.error('--flip-front-back cannot be combined with non-zero --rotation-degrees')
+        args.rotation_degrees = (0.0, 0.0, 180.0)
+    if args.glb is not None:
+        args.glb = args.glb.expanduser().resolve()
+        if not args.glb.is_file() or args.glb.stat().st_size == 0:
+            parser.error(f'Local GLB is missing or empty: {args.glb}')
+        if args.bos_uri is not None:
+            parser.error('--bos-uri cannot be combined with --glb')
     if args.uuid is None:
         args.uuid = args.uuid_option
     elif args.uuid_option is not None and args.uuid != args.uuid_option:
@@ -454,7 +683,7 @@ def _parse_args(parser: argparse.ArgumentParser, argv: Optional[list[str]]) -> a
         )
     args.output_dir = args.output_dir.expanduser().resolve()
     args.cache_dir = (args.cache_dir or args.output_dir / ".cache").expanduser().resolve()
-    pbr_suffix = ".ply" if args.visualize else "." + args.output_format
+    pbr_suffix = '.pbr.pkl' if args.pkl_only else (".ply" if args.visualize else "." + args.output_format)
     args.output_path = (
         args.output.expanduser().resolve()
         if args.output
@@ -465,32 +694,53 @@ def _parse_args(parser: argparse.ArgumentParser, argv: Optional[list[str]]) -> a
         if args.geometry_output
         else args.output_dir / (args.uuid + ".geometry.vxz")
     )
-    if args.output_path.suffix.lower() != pbr_suffix:
-        parser.error(f"--output must use the {pbr_suffix} suffix")
+    required_suffix = '.pkl' if args.pkl_only else pbr_suffix
+    if args.output_path.suffix.lower() != required_suffix:
+        parser.error(f"--output must use the {required_suffix} suffix")
     if args.geometry_output_path.suffix.lower() != ".vxz":
         parser.error("--geometry-output must use the .vxz suffix")
-    if args.output_path == args.geometry_output_path:
+    if not args.pkl_only and args.output_path == args.geometry_output_path:
         parser.error("PBR and geometry output paths must be different")
-    for path in (args.output_path, args.geometry_output_path):
+    output_paths = (args.output_path,) if args.pkl_only else (args.output_path, args.geometry_output_path)
+    dump_path = args.cache_dir / f'{args.uuid}.pbr.pkl'
+    error_path = dump_path.with_name(dump_path.name + '_error.txt')
+    if args.glb is not None and args.glb in (*output_paths, dump_path, error_path):
+        parser.error('Local GLB input must differ from output and intermediate paths')
+    for path in output_paths:
         if path.exists() and not args.overwrite:
             raise FileExistsError(f"Output exists (use --overwrite): {path}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
-    args.geometry_output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not args.pkl_only:
+        args.geometry_output_path.parent.mkdir(parents=True, exist_ok=True)
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = build_parser()
+def main(argv: Optional[list[str]] = None, *, local: bool = False) -> int:
+    parser = build_parser(local=local)
     args = _parse_args(parser, argv)
-    client = _make_bos_client(args.bos_endpoint, args.bos_access_key_id, args.bos_secret_access_key)
-    glb_path = args.cache_dir / f"{args.uuid}.glb"
+    client = (_make_bos_client(args.bos_endpoint, args.bos_access_key_id, args.bos_secret_access_key)
+              if args.glb is None or args.upload else None)
+    glb_path = args.glb if args.glb is not None else args.cache_dir / f"{args.uuid}.glb"
     dump_path = args.cache_dir / f"{args.uuid}.pbr.pkl"
     try:
-        download_glb(client, args.bos_bucket, args.bos_folder, args.uuid, glb_path)
+        if args.glb is None:
+            _download_input_glb(
+                client, args.bos_bucket, args.bos_folder, args.uuid, glb_path,
+                args.bos_uri,
+            )
         run_blender_dump(args.blender, glb_path, dump_path)
         dump = _load_dump(dump_path)
+        if any(value != 0.0 for value in args.rotation_degrees):
+            rotate_dump_geometry(dump, args.rotation_degrees)
+            with dump_path.open('wb') as stream:
+                pickle.dump(dump, stream)
+        if args.pkl_only:
+            with args.output_path.open('wb') as stream:
+                pickle.dump(dump, stream)
+            print(f'Wrote PBR dump {args.output_path}')
+            return 0
         pbr_coord, pbr_attr = _convert_pbr_attributes(dump, args)
         geo_coord, geo_attr = convert_geometry(dump, args.geometry_resolution, timing=args.timing)
         pbr_coord, pbr_attr, geo_coord, geo_attr, common = intersect_voxels(
@@ -520,9 +770,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"Uploaded geometry -> bos://{args.upload_bucket}/{geo_key}")
         return 0
     finally:
-        # Match create_vxz.py: never retain Blender's error sidecar, and with
-        # --upload remove every local artifact even if either upload fails.
-        cleanup = [glb_path, dump_path.with_name(dump_path.name + "_error.txt")]
+        # Remove error sidecars and downloaded inputs. With --upload, generated
+        # artifacts are temporary even on failure; caller-owned GLBs remain.
+        cleanup = [dump_path.with_name(dump_path.name + "_error.txt")]
+        if args.glb is None:
+            cleanup.append(glb_path)
         if args.upload:
             cleanup.extend((dump_path, args.output_path, args.geometry_output_path))
         for path in cleanup:

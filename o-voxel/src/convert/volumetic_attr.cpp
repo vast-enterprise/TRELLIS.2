@@ -16,6 +16,26 @@ static thread_local bool g_multi_surface = false;
 static thread_local float g_multi_surface_cluster_angle = 15.0f;
 static thread_local int64_t g_multi_surface_max_records_per_voxel = 0;
 static thread_local int64_t g_multi_surface_max_total_records = 0;
+// Optional per-triangle-corner COLOR_0 values, normalized to [0, 1].  The
+// legacy entry points leave this null and therefore retain their exact
+// material-only behavior.
+static thread_local const float* g_vertex_colors = nullptr;
+static thread_local torch::Tensor g_vertex_color_tensor;
+
+void set_vertex_colors_cpu(const torch::Tensor& colors) {
+    TORCH_CHECK(colors.device().is_cpu() && colors.scalar_type() == torch::kFloat32 &&
+                colors.dim() == 3 && colors.size(1) == 3 && colors.size(2) == 4,
+                "vertex colors must be CPU float32 [N_tri,3,4]");
+    TORCH_CHECK(torch::isfinite(colors).all().item<bool>(),
+                "vertex colors must contain only finite values");
+    g_vertex_color_tensor = colors.contiguous();
+    g_vertex_colors = g_vertex_color_tensor.data_ptr<float>();
+}
+
+void clear_vertex_colors_cpu() {
+    g_vertex_color_tensor = torch::Tensor();
+    g_vertex_colors = nullptr;
+}
 
 template <typename T, typename U>
 static inline U lerp(const T& a, const T& b, const T& t, const U& val_a, const U& val_b) {
@@ -679,6 +699,27 @@ voxelize_trimesh_pbr_impl(
             baseColor[0] *= baseColorFactor[mid][0];
             baseColor[1] *= baseColorFactor[mid][1];
             baseColor[2] *= baseColorFactor[mid][2];
+            float vertex_alpha = 1.0f;
+            if (g_vertex_colors != nullptr) {
+                const size_t color_ptr = tid * 12;
+                Eigen::Vector3f c0(g_vertex_colors[color_ptr + 0],
+                                   g_vertex_colors[color_ptr + 1],
+                                   g_vertex_colors[color_ptr + 2]);
+                Eigen::Vector3f c1(g_vertex_colors[color_ptr + 4],
+                                   g_vertex_colors[color_ptr + 5],
+                                   g_vertex_colors[color_ptr + 6]);
+                Eigen::Vector3f c2(g_vertex_colors[color_ptr + 8],
+                                   g_vertex_colors[color_ptr + 9],
+                                   g_vertex_colors[color_ptr + 10]);
+                const Eigen::Vector3f vc = uv_barycentric.x() * c0 +
+                    uv_barycentric.y() * c1 + uv_barycentric.z() * c2;
+                baseColor[0] *= vc.x();
+                baseColor[1] *= vc.y();
+                baseColor[2] *= vc.z();
+                vertex_alpha = uv_barycentric.x() * g_vertex_colors[color_ptr + 3] +
+                    uv_barycentric.y() * g_vertex_colors[color_ptr + 7] +
+                    uv_barycentric.z() * g_vertex_colors[color_ptr + 11];
+            }
 
             /// metallic
             float metallic = 1.0f;
@@ -743,6 +784,7 @@ voxelize_trimesh_pbr_impl(
                     );
                 }
                 alpha *= alphaFactor[mid];
+                alpha *= vertex_alpha;
                 if (alphaMode[mid] == 1) {       // MASK
                     alpha = alpha < alphaCutoff[mid] ? 0.0f : 1.0f;
                 }
@@ -1077,6 +1119,15 @@ textured_mesh_to_volumetric_attr_cpu(
     TORCH_CHECK(vertices.dim() == 3 && vertices.size(1) == 3 && vertices.size(2) == 3,
                 "vertices must have shape [N,3,3]");
     const int N_tri = vertices.size(0);
+    if (g_vertex_color_tensor.defined()) {
+        TORCH_CHECK(g_vertex_color_tensor.device().is_cpu() &&
+                    g_vertex_color_tensor.scalar_type() == torch::kFloat32 &&
+                    g_vertex_color_tensor.dim() == 3 &&
+                    g_vertex_color_tensor.size(0) == N_tri &&
+                    g_vertex_color_tensor.size(1) == 3 &&
+                    g_vertex_color_tensor.size(2) == 4,
+                    "vertex colors must be CPU float32 [N_tri,3,4] with N_tri rows");
+    }
     TORCH_CHECK(normals.sizes() == vertices.sizes(), "normals must match vertices shape");
     TORCH_CHECK(uvs.dim() == 3 && uvs.size(0) == N_tri && uvs.size(1) == 3 && uvs.size(2) == 2,
                 "uvs must have shape [N,3,2]");

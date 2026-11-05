@@ -16,6 +16,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Convert functions
     m.def("mesh_to_flexible_dual_grid_cpu", &mesh_to_flexible_dual_grid_cpu, py::call_guard<py::gil_scoped_release>());
     m.def("textured_mesh_to_volumetric_attr_cpu", &textured_mesh_to_volumetric_attr_cpu, py::call_guard<py::gil_scoped_release>());
+    m.def("set_vertex_colors_cpu", &set_vertex_colors_cpu);
+    m.def("clear_vertex_colors_cpu", &clear_vertex_colors_cpu);
     m.def("textured_mesh_to_volumetric_attr_multi_cpu", &textured_mesh_to_volumetric_attr_multi_cpu, py::call_guard<py::gil_scoped_release>());
     m.def("textured_mesh_to_volumetric_attr_multi_topology_cpu", &textured_mesh_to_volumetric_attr_multi_topology_cpu, py::call_guard<py::gil_scoped_release>());
     // Serialization functions

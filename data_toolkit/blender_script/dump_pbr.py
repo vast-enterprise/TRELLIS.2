@@ -323,6 +323,135 @@ def try_extract_image_with_factor(link, expected_channel='RGB'):
     return (factor, image)
 
 
+def _is_vertex_color_node(node):
+    """Return whether *node* reads the glTF per-corner color attribute.
+
+    Blender's glTF importer has used both ``Vertex Color`` and generic
+    ``Attribute`` nodes over its supported versions.  Keep this check narrow
+    enough that unrelated attributes are not silently treated as COLOR_0.
+    """
+    if node.type == 'VERTEX_COLOR':
+        return True
+    if node.type == 'ATTRIBUTE':
+        name = getattr(node, 'attribute_name', '') or ''
+        return name.upper() in {'COLOR_0', 'COLOR', 'COL'}
+    return False
+
+
+def _vertex_color_layer_name(node):
+    """Return an explicitly requested color attribute layer, when present."""
+    if node.type == 'ATTRIBUTE':
+        value = getattr(node, 'attribute_name', '') or ''
+    elif node.type == 'VERTEX_COLOR':
+        value = getattr(node, 'layer_name', '') or ''
+    else:
+        value = ''
+    value = str(value).strip()
+    return value or None
+
+
+def _base_color_source(link):
+    """Extract constants, image texture and optional COLOR_0 from a color graph.
+
+    The existing dump format stores material constants and image textures
+    separately.  A vertex-color input is an additional per-corner multiplier,
+    so it is returned as a flag and is sampled by the voxelizer.  This handles
+    the common glTF graphs (direct image/color, and multiply image * vertex
+    color) while leaving unsupported graphs on the historical error path.
+    """
+    def visit(current, seen):
+        node = current.from_node
+        if id(node) in seen:
+            raise AssertionError("Material color graph contains a cycle")
+        seen = seen | {id(node)}
+        if _is_vertex_color_node(node):
+            return [1.0, 1.0, 1.0], None, True, _vertex_color_layer_name(node)
+        if node.type == 'TEX_IMAGE' and current.from_socket.name == 'Color':
+            return [1.0, 1.0, 1.0], extract_image(node, [0, 1, 2, 3]), False, None
+        if node.type == 'RGB':
+            return list(node.outputs[0].default_value)[:3], None, False, None
+        if node.type in {'MIX', 'MIX_RGB'}:
+            if node.type == 'MIX':
+                data_type = getattr(node, 'data_type', None)
+                blend_type = getattr(node, 'blend_type', None)
+                fac = node.inputs.get('Factor')
+                a = node.inputs.get('A')
+                b = node.inputs.get('B')
+            else:
+                data_type = 'RGBA'
+                blend_type = getattr(node, 'blend_type', None)
+                fac = node.inputs.get('Fac')
+                a = node.inputs.get('Color1')
+                b = node.inputs.get('Color2')
+            if data_type not in (None, 'RGBA') or blend_type != 'MULTIPLY':
+                raise AssertionError("Material color graph is not a multiply")
+            if fac is not None and fac.is_linked:
+                raise AssertionError("Material color graph has a linked mix factor")
+            if fac is not None and abs(float(fac.default_value) - 1.0) > 1e-6:
+                raise AssertionError("Material color graph has a partial mix factor")
+            if a is None or b is None:
+                raise AssertionError("Material color graph has incomplete multiply inputs")
+            result = [1.0, 1.0, 1.0], None, False, None
+            for socket in (a, b):
+                if socket.is_linked:
+                    part = visit(socket.links[0], seen)
+                else:
+                    value = list(socket.default_value)
+                    part = (value[:3], None, False, None)
+                if result[1] is not None and part[1] is not None:
+                    raise AssertionError("Material color graph has multiple image textures")
+                if result[2] and part[2]:
+                    raise AssertionError("Material color graph has multiple vertex colors")
+                if result[3] and part[3] and result[3].upper() != part[3].upper():
+                    raise AssertionError("Material color graph has multiple vertex color layers")
+                result = ([x * y for x, y in zip(result[0], part[0])],
+                          result[1] or part[1], result[2] or part[2],
+                          result[3] or part[3])
+            return result
+        if node.type == 'SEPRGB' and current.from_socket.name in {'Image', 'Color'}:
+            if not node.inputs[0].is_linked:
+                raise AssertionError("Material color graph has incomplete separator")
+            return visit(node.inputs[0].links[0], seen)
+        raise AssertionError(f"Unsupported material color node: {node.type}")
+
+    return visit(link, set())
+
+
+def ensure_default_materials():
+    """Give mesh faces without a material Blender's default Principled BSDF."""
+    default_material = None
+
+    def get_default_material():
+        nonlocal default_material
+        if default_material is None:
+            default_material = bpy.data.materials.new(name='DefaultPBR')
+            default_material.use_nodes = True
+        return default_material
+
+    for obj in bpy.context.scene.objects:
+        if obj.type != 'MESH':
+            continue
+        if not obj.material_slots:
+            obj.data.materials.append(get_default_material())
+        for slot in obj.material_slots:
+            if slot.material is None:
+                slot.material = get_default_material()
+
+        # Invalid face indices can also occur in imported meshes. Preserve
+        # valid assignments and send only unassigned faces to the fallback.
+        missing_faces = [face for face in obj.data.polygons
+                         if face.material_index >= len(obj.material_slots)]
+        if missing_faces:
+            fallback = get_default_material()
+            fallback_index = next((i for i, slot in enumerate(obj.material_slots)
+                                   if slot.material == fallback), None)
+            if fallback_index is None:
+                fallback_index = len(obj.material_slots)
+                obj.data.materials.append(fallback)
+            for face in missing_faces:
+                face.material_index = fallback_index
+
+
 def main(arg):    
     # Initialize context
     if arg.object.endswith(".blend"):
@@ -331,6 +460,10 @@ def main(arg):
         init_scene()
         load_object(arg.object)
     print('[INFO] Scene initialized.')
+
+    # Material IDs are indices into bpy.data.materials, so create fallbacks
+    # before serializing that collection or evaluating the mesh.
+    ensure_default_materials()
     
     # Normalize scene
     scale, offset = normalize_scene()
@@ -361,6 +494,7 @@ def main(arg):
             "alphaMode": "OPAQUE",
             "alphaCutoff": 0.5,
             "baseColorTexture": None,
+            "baseColorUseVertexColor": False,
             "alphaTexture": None,
             "metallicTexture": None,
             "roughnessTexture": None,
@@ -390,12 +524,11 @@ def main(arg):
                     pack["alphaMode"] = "BLEND"
                 if emission_node.inputs['Color'].is_linked:
                     link = emission_node.inputs['Color'].links[0]
-                    if link.from_node.type == 'RGB':
-                        pack['baseColorFactor'] = list(link.from_node.outputs[0].default_value)
-                    else:
-                        factor, image = try_extract_image_with_factor(link, 'RGB')
-                        pack['baseColorFactor'] = factor
-                        pack['baseColorTexture'] = image
+                    factor, image, uses_vertex_color, vertex_color_layer = _base_color_source(link)
+                    pack['baseColorFactor'] = factor
+                    pack['baseColorTexture'] = image
+                    pack['baseColorUseVertexColor'] = uses_vertex_color
+                    pack['baseColorVertexColorLayer'] = vertex_color_layer
                 else:
                     pack['baseColorFactor'] = list(emission_node.inputs['Color'].default_value)
                 pack['emissionStrength'] = float(emission_node.inputs['Strength'].default_value)
@@ -419,12 +552,11 @@ def main(arg):
                 pack["baseColorFactor"] = list(principled_node.inputs['Base Color'].default_value)
             elif principled_node is not None:
                 link = principled_node.inputs['Base Color'].links[0]
-                if link.from_node.type == 'RGB':
-                    pack["baseColorFactor"] = list(link.from_node.outputs[0].default_value)
-                else:
-                    factor, image = try_extract_image_with_factor(link, 'RGB')
-                    pack["baseColorFactor"] = factor
-                    pack["baseColorTexture"] = image
+                factor, image, uses_vertex_color, vertex_color_layer = _base_color_source(link)
+                pack["baseColorFactor"] = factor
+                pack["baseColorTexture"] = image
+                pack["baseColorUseVertexColor"] = uses_vertex_color
+                pack["baseColorVertexColorLayer"] = vertex_color_layer
 
             # Handle emission on Principled BSDF.  Blender 4.x exposes
             # ``Emission Color`` and ``Emission Strength``; older files may
@@ -583,6 +715,52 @@ def main(arg):
                 else -1
                 for triangle in triangles
             ], dtype=np.int32)
+
+            # Preserve glTF COLOR_0 per-corner data.  Blender exposes imported
+            # vertex colors through color_attributes; both CORNER (the usual
+            # glTF representation) and POINT domains are supported.  Store
+            # RGBA float values in triangle-loop order so the voxelizer can
+            # interpolate them at the same surface query as UV/base color.
+            object_material_ids = {
+                int(value) for value in np.asarray(pack['mat_ids']).reshape(-1)
+            }
+            object_requires_color = any(
+                0 <= value < len(output['materials']) and
+                output['materials'][value].get('baseColorUseVertexColor', False)
+                for value in object_material_ids
+            )
+            if object_requires_color:
+                color_attributes = list(getattr(eval_mesh, 'color_attributes', []))
+                layers_by_name = {layer.name.upper(): layer for layer in color_attributes}
+                semantic_layer = next((layer for layer in color_attributes
+                                       if layer.name.upper() in {'COLOR_0', 'COLOR', 'COL'}), None)
+                colors = []
+                for triangle_index, triangle in enumerate(triangles):
+                    material_index = int(pack['mat_ids'][triangle_index])
+                    material = (output['materials'][material_index]
+                                if 0 <= material_index < len(output['materials']) else None)
+                    if material is None or not material.get('baseColorUseVertexColor', False):
+                        colors.append([[1.0, 1.0, 1.0, 1.0]] * 3)
+                        continue
+                    requested = material.get('baseColorVertexColorLayer')
+                    color_layer = (layers_by_name.get(str(requested).upper())
+                                   if requested else semantic_layer)
+                    if color_layer is None and requested and str(requested).upper() in {'COLOR_0', 'COLOR', 'COL'}:
+                        color_layer = semantic_layer
+                    if color_layer is None:
+                        raise RuntimeError(
+                            f'Vertex color layer {requested!r} is missing from mesh'
+                        )
+                    row = []
+                    for loop_index, vertex_index in zip(triangle.loops, triangle.vertices):
+                        data_index = loop_index if color_layer.domain == 'CORNER' else vertex_index
+                        value = color_layer.data[data_index].color
+                        row.append([float(value[0]), float(value[1]), float(value[2]),
+                                    float(value[3]) if len(value) > 3 else 1.0])
+                    colors.append(row)
+                pack['vertex_colors'] = np.asarray(colors, dtype=np.float32).reshape(-1, 3, 4)
+            else:
+                pack['vertex_colors'] = None
 
             output['objects'].append(pack)
         finally:

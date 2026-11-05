@@ -22,6 +22,7 @@ from .vxz import _compress, _decompress, DEFAULT_COMPRESION_LEVEL
 
 __all__ = [
     "read_vxzm", "read_vxzm_info", "read_vxzm_regions", "write_vxzm",
+    "read_vxzm_mesh",
     "vxzm_to_ply", "vxzm_multi_sample_to_ply",
 ]
 
@@ -31,6 +32,43 @@ NORMAL_SOURCES = {0: "surface_authored_with_winding_guard",
                   1: "geometry_reoriented_face_v1",
                   2: "geometry_reoriented_face_v1"}
 TOPOLOGY_BITS = {'0': 'contributing_triangle_touches_multi_face_edge'}
+
+
+MESH_STORAGE = "normalized_triangle_mesh_v1"
+
+
+def _mesh_arrays(vertices, faces):
+    """Validate before casting so float/overflowing face indices cannot wrap."""
+    if torch.is_tensor(vertices):
+        vertices = vertices.detach().cpu().numpy()
+    if torch.is_tensor(faces):
+        faces = faces.detach().cpu().numpy()
+    vertices, faces = np.asarray(vertices), np.asarray(faces)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or not len(vertices):
+        raise ValueError("mesh vertices must be nonempty [N, 3]")
+    if faces.ndim != 2 or faces.shape[1] != 3 or not len(faces):
+        raise ValueError("mesh faces must be nonempty [M, 3]")
+    if vertices.dtype.kind not in 'fiu' or not np.isfinite(vertices).all():
+        raise ValueError("mesh vertices must contain finite numbers")
+    if np.any(vertices < -0.5) or np.any(vertices > 0.5):
+        raise ValueError("mesh vertices must use the normalized [-0.5, 0.5] scene frame")
+    if (faces.dtype.kind not in 'iu' or np.any(faces < 0) or
+            np.any(faces >= len(vertices)) or np.any(faces > np.iinfo(np.int32).max)):
+        raise ValueError("mesh faces must contain valid int32 vertex indices")
+    return np.ascontiguousarray(vertices, dtype='<f4'), np.ascontiguousarray(faces, dtype='<i4')
+
+
+def _decode_mesh(info, section):
+    mesh = info.get('mesh')
+    if mesh is None:
+        return None
+    vertices_raw, faces_raw = section('mesh_vertices'), section('mesh_faces')
+    if (len(vertices_raw) != mesh['num_vertices'] * 12 or
+            len(faces_raw) != mesh['num_faces'] * 12):
+        raise ValueError('VXZM mesh section size does not match header')
+    vertices, faces = _mesh_arrays(np.frombuffer(vertices_raw, dtype='<f4').reshape(-1, 3),
+                                  np.frombuffer(faces_raw, dtype='<i4').reshape(-1, 3))
+    return vertices.copy(), faces.copy()
 
 
 def _read_file(file) -> bytes:
@@ -117,15 +155,26 @@ def _validate_header(info: Dict, header_end: int,
             expected['topology'] = 1
             if info.get('topology_bits') != TOPOLOGY_BITS:
                 raise ValueError('VXZM v2 requires the defined topology bit semantics')
-        if channels != expected:
-            raise ValueError(f'VXZM v{info["version"]} requires {expected}')
+        allowed = [expected, {**expected, 'alpha': 1}]
+        if channels not in allowed:
+            raise ValueError(f'VXZM v{info["version"]} requires {expected} (optional alpha[1])')
 
     sections = info.get("sections")
     required = ("region_svo", "region_counts", "region_offsets", "records")
     if not isinstance(sections, dict) or any(name not in sections for name in required):
         raise ValueError("VXZM header is missing required sections")
+    mesh = info.get('mesh')
+    if mesh is not None:
+        if (not isinstance(mesh, dict) or mesh.get('storage') != MESH_STORAGE or
+                mesh.get('vertices_dtype') != '<f4' or mesh.get('faces_dtype') != '<i4' or
+                any(type(mesh.get(k)) is not int or mesh[k] <= 0
+                    for k in ('num_vertices', 'num_faces')) or
+                any(k not in sections for k in ('mesh_vertices', 'mesh_faces'))):
+            raise ValueError('Invalid VXZM mesh descriptor')
+    elif any(k in sections for k in ('mesh_vertices', 'mesh_faces')):
+        raise ValueError('VXZM mesh sections require a mesh descriptor')
     ranges = []
-    for name in required:
+    for name in sections:
         ptr = sections[name]
         if (not isinstance(ptr, list) or len(ptr) != 2 or
                 any(not isinstance(value, int) for value in ptr)):
@@ -174,6 +223,22 @@ def read_vxzm_info(file) -> Dict:
         return info
     data = _read_file(file)
     return _parse_header(data, len(data))
+
+
+def read_vxzm_mesh(file):
+    """Read optional mesh as float32 vertices / int32 faces, or return None.
+
+    Path inputs read only the header and mesh sections, without reading or
+    decompressing voxel records. Vertices use the same normalized scene frame
+    as sampling; face winding and disconnected objects are preserved.
+    """
+    if isinstance(file, (str, os.PathLike)):
+        with open(file, 'rb') as stream:
+            info, size = _read_path_header(stream)
+            return _decode_mesh(info, lambda name: _path_section(stream, size, info, name))
+    data = _read_file(file)
+    info = _parse_header(data, len(data))
+    return _decode_mesh(info, lambda name: _section(data, info, name))
 
 
 def _section(data: bytes, info: Dict, name: str) -> bytes:
@@ -388,7 +453,8 @@ def read_vxzm_regions(file):
     )
 
 
-def read_vxzm(file, num_threads: int = -1, return_regions: bool = False):
+def read_vxzm(file, num_threads: int = -1, return_regions: bool = False,
+              return_mesh: bool = False):
     """Read a VXZM file and return ``(coord, attr)``.
 
     ``coord`` has one row per record and is intentionally allowed to contain
@@ -399,7 +465,9 @@ def read_vxzm(file, num_threads: int = -1, return_regions: bool = False):
     second file read/decompression in multi-surface training loaders that
     require both the records and their coarse-region index.  ``offsets`` are
     byte offsets into the uncompressed records section, including its final
-    sentinel.
+    sentinel. If ``return_mesh`` is true, append a ``(vertices, faces)``
+    NumPy tuple (or None for mesh-free files) to the result. Mesh sections are
+    decompressed only on request, using the same file buffer.
     """
     data = _read_file(file)
     info = _parse_header(data, len(data))
@@ -482,8 +550,9 @@ def read_vxzm(file, num_threads: int = -1, return_regions: bool = False):
     if int(unique_count) != int(info["num_unique_voxels"]):
         raise ValueError("VXZM unique voxel count does not match payload")
     coord = coords
+    result = (coord, attr)
     if return_regions:
-        return (
+        result = (
             coord,
             attr,
             region_coord,
@@ -491,7 +560,9 @@ def read_vxzm(file, num_threads: int = -1, return_regions: bool = False):
             torch.from_numpy(offsets.copy()).to(torch.int64),
             info,
         )
-    return coord, attr
+    if return_mesh:
+        result += (_decode_mesh(info, lambda name: _section(data, info, name)),)
+    return result
 
 
 def write_vxzm(
@@ -504,14 +575,24 @@ def write_vxzm(
     compression_level: Optional[int] = None,
     metadata: Optional[Dict] = None,
     normal_source: str = "surface_authored_with_winding_guard",
+    mesh_vertices=None,
+    mesh_faces=None,
 ):
     """Write multi-surface voxel records to VXZM.
 
     ``coord`` may contain duplicates.  Attributes must be uint8 tensors with
     one row per record.  The three coordinate bytes stored in each region are
     local coordinates, while the coarse region tree stores the 256^3 region
-    positions in Morton order.
+    positions in Morton order. Optional ``mesh_vertices`` and ``mesh_faces``
+    must be supplied together in the normalized scene frame. They are stored
+    as independent compressed sections; records and their format version are
+    unchanged. No mesh is stored by default.
     """
+    mesh = None
+    if (mesh_vertices is None) != (mesh_faces is None):
+        raise ValueError("mesh_vertices and mesh_faces must be supplied together")
+    if mesh_vertices is not None:
+        mesh = _mesh_arrays(mesh_vertices, mesh_faces)
     versions = {source: version for version, source in NORMAL_SOURCES.items()}
     if normal_source not in versions:
         raise ValueError(f'Unsupported VXZM normal_source: {normal_source}')
@@ -521,8 +602,10 @@ def write_vxzm(
         expected = {'base_color': 3, 'normal': 3, 'confidence': 1}
         if version == 2:
             expected['topology'] = 1
-        if {k: v.shape[1] for k, v in attr.items() if v.ndim == 2} != expected:
-            raise ValueError(f'VXZM v{version} requires {expected}')
+        channels = {k: v.shape[1] for k, v in attr.items() if v.ndim == 2}
+        allowed = [expected, {**expected, 'alpha': 1}]
+        if channels not in allowed:
+            raise ValueError(f'VXZM v{version} requires {expected} plus optional alpha[1]')
     if coord.ndim != 2 or coord.shape[1] != 3:
         raise ValueError("coord must have shape [N, 3]")
     if coord.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint16):
@@ -623,6 +706,9 @@ def write_vxzm(
         "region_offsets": offsets_bytes,
         "records": records,
     }
+    if mesh is not None:
+        sections_raw['mesh_vertices'] = mesh[0].tobytes()
+        sections_raw['mesh_faces'] = mesh[1].tobytes()
     sections = {}
     binary = b""
     for key, raw in sections_raw.items():
@@ -647,6 +733,9 @@ def write_vxzm(
         "record_layout": [{"name": name, "dtype": "u1", "channels": int(value.shape[1])}
                           for name, value in attr.items()],
     }
+    if mesh is not None:
+        header['mesh'] = dict(storage=MESH_STORAGE, num_vertices=len(mesh[0]),
+                              num_faces=len(mesh[1]), vertices_dtype='<f4', faces_dtype='<i4')
     if version == 2:
         header['topology_bits'] = dict(TOPOLOGY_BITS)
     if metadata is not None:

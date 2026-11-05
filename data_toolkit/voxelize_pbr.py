@@ -14,7 +14,7 @@ import o_voxel
 
 
 VXZM_NORMAL_SOURCE = 'geometry_reoriented_face_v1'
-VXZM_RECORD_LAYOUT = [['base_color', 3], ['normal', 3], ['confidence', 1], ['topology', 1]]
+VXZM_RECORD_LAYOUT = [['base_color', 3], ['normal', 3], ['confidence', 1], ['topology', 1], ['alpha', 1]]
 VXZM_CONFIDENCE_SOURCE = 'cluster_count_v1'
 VXZM_MERGE_WEIGHT = 'closest_point_gaussian_voxel_v1'
 VXZM_TOPOLOGY_SOURCE = 'source_triangle_multi_face_edge_v1'
@@ -35,6 +35,8 @@ def _expected_vxzm_config(resolution):
         'cluster_angle_degrees': float(opt.cluster_angle_degrees),
         'max_records_per_voxel': int(opt.max_records_per_voxel),
         'max_total_records': int(opt.max_total_records),
+        **({'mesh_storage': 'normalized_triangle_mesh_v1'}
+           if getattr(opt, 'store_mesh', False) else {}),
     }, sort_keys=True, separators=(',', ':'))
 
 
@@ -64,6 +66,7 @@ def _vxzm_config_from_info(info):
             'cluster_angle_degrees': float(metadata['cluster_angle_degrees']),
             'max_records_per_voxel': int(metadata['max_records_per_voxel']),
             'max_total_records': int(metadata['max_total_records']),
+            **({'mesh_storage': info['mesh']['storage']} if info.get('mesh') else {}),
         }, sort_keys=True, separators=(',', ':'))
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
@@ -221,9 +224,12 @@ def _pbr_voxelize(file, metadatum, pbr_dump_root, root):
                         dump, cluster_angle_degrees=opt.cluster_angle_degrees,
                         max_records_per_voxel=opt.max_records_per_voxel,
                         max_total_records=opt.max_total_records, **common)
+                    mesh = o_voxel.convert.mesh_from_dump(dump) if getattr(opt, 'store_mesh', False) else None
                     o_voxel.io.write_vxzm(vxzm_path, coord, attr, grid_size=res,
                                            region_resolution=opt.region_resolution,
                                            normal_source=VXZM_NORMAL_SOURCE,
+                                           **(dict(mesh_vertices=mesh[0], mesh_faces=mesh[1])
+                                              if mesh is not None else {}),
                                            metadata={
                                                'cluster_angle_degrees': opt.cluster_angle_degrees,
                                                'color_space': opt.color_space,
@@ -234,6 +240,8 @@ def _pbr_voxelize(file, metadatum, pbr_dump_root, root):
                                                'merge_weight': VXZM_MERGE_WEIGHT,
                                                'topology_source': VXZM_TOPOLOGY_SOURCE,
                                                'normal_preprocessing': dump.get('normal_preprocessing', {}),
+                                               **({'mesh_storage': 'normalized_triangle_mesh_v1'}
+                                                  if getattr(opt, 'store_mesh', False) else {}),
                                            })
                     info = o_voxel.io.read_vxzm_info(vxzm_path)
                     pack[f'pbrm_voxelized_{res}'] = True
@@ -266,6 +274,8 @@ if __name__ == '__main__':
     parser.add_argument('--color_space', choices=['linear', 'srgb', 'agx'], default='agx',
                         help='Color encoding written into the base_color voxel attribute')
     parser.add_argument('--output-format', choices=['vxz', 'vxzm', 'both'], default='vxz')
+    parser.add_argument('--store-mesh', action=argparse.BooleanOptionalAction, default=False,
+                        help='Embed normalized vertices/faces in VXZM for VAE validation (default: off)')
     parser.add_argument('--cluster-angle-degrees', type=float, default=15.0)
     parser.add_argument('--region-resolution', type=int, default=256)
     parser.add_argument('--max-records-per-voxel', type=int, default=0,
@@ -283,6 +293,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_workers', type=int, default=0)
     opt = parser.parse_args(sys.argv[2:])
     opt = edict(vars(opt))
+    if opt.store_mesh and opt.output_format == 'vxz':
+        parser.error('--store-mesh requires --output-format vxzm or both')
     opt.resolution = sorted([int(x) for x in opt.resolution.split(',')], reverse=True)
     if not np.isfinite(opt.cluster_angle_degrees) or not (0.0 < opt.cluster_angle_degrees < 180.0):
         parser.error('--cluster-angle-degrees must be in (0, 180)')

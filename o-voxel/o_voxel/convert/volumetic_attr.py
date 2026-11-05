@@ -429,6 +429,7 @@ def blender_dump_to_volumetric_attr(
         'normals': [],
         'uvs': [],
         'material_ids': [],
+        'vertex_colors': [],
         'topology': [],
         'base_color_factor': [],
         'base_color_texture': [],
@@ -511,7 +512,8 @@ def blender_dump_to_volumetric_attr(
         if material['baseColorTexture'] is not None:
             baseColorTexture, baseColorTextureFilter, baseColorTextureWrap = \
                 load_texture(material['baseColorTexture'], channels=[0, 1, 2],
-                             premultiply_alpha=not is_emission_shader, decode_srgb=True)
+                             premultiply_alpha=not is_emission_shader,
+                             decode_srgb=True)
             assert baseColorTexture.shape[2] == 3, f"Base color texture must have 3 channels, but got {baseColorTexture.shape[2]}"
         else:
             baseColorTexture = torch.tensor([])
@@ -599,10 +601,24 @@ def blender_dump_to_volumetric_attr(
         normails = torch.tensor(object['normals'], dtype=torch.float32)
         uvs = torch.tensor(object['uvs'], dtype=torch.float32) if object['uvs'] is not None else torch.zeros(triangles.shape[0], 3, 2, dtype=torch.float32)
         material_id = torch.tensor(object['mat_ids'], dtype=torch.int32)
+        raw_colors = object.get('vertex_colors')
+        if raw_colors is None:
+            vertex_colors = torch.ones((triangles.shape[0], 3, 4), dtype=torch.float32)
+        else:
+            vertex_colors = torch.as_tensor(raw_colors, dtype=torch.float32)
+            if vertex_colors.shape != (triangles.shape[0], 3, 4):
+                raise ValueError(
+                    f"vertex_colors must have shape {(triangles.shape[0], 3, 4)}, "
+                    f"got {tuple(vertex_colors.shape)}"
+                )
+            if not torch.isfinite(vertex_colors).all():
+                raise ValueError("vertex_colors contains NaN or infinite values")
+            vertex_colors = torch.clamp(vertex_colors, 0.0, 1.0)
         scene_buffers['triangles'].append(triangles)
         scene_buffers['normals'].append(normails)
         scene_buffers['uvs'].append(uvs)
         scene_buffers['material_ids'].append(material_id)
+        scene_buffers['vertex_colors'].append(vertex_colors)
         if multi_surface:
             if dump.get('surface_normal_source') == GEOMETRY_NORMAL_SOURCE and 'topology' not in object:
                 raise ValueError('Canonical dump lacks triangle topology; regenerate with current dump_pbr.py')
@@ -615,6 +631,7 @@ def blender_dump_to_volumetric_attr(
     scene_buffers['normals'] = torch.cat(scene_buffers['normals'], dim=0)       # [N, 3, 3]
     scene_buffers['uvs'] = torch.cat(scene_buffers['uvs'], dim=0)               # [N, 3, 2]
     scene_buffers['material_ids'] = torch.cat(scene_buffers['material_ids'], dim=0)  # [N]
+    scene_buffers['vertex_colors'] = torch.cat(scene_buffers['vertex_colors'], dim=0)  # [N,3,4]
 
     scene_buffers['uvs'][:, :, 1] = 1 - scene_buffers['uvs'][:, :, 1]  # Flip v coordinate
 
@@ -642,6 +659,28 @@ def blender_dump_to_volumetric_attr(
     native_fn = (_C.textured_mesh_to_volumetric_attr_multi_topology_cpu if canonical else
                  _C.textured_mesh_to_volumetric_attr_multi_cpu if multi_surface
                  else _C.textured_mesh_to_volumetric_attr_cpu)
+    # Vertex colors are opt-in per material.  Keep the native sampler disabled
+    # for ordinary textured/material-only assets so their byte-for-byte path
+    # remains unchanged.  For a mixed scene, non-COLOR_0 triangles use ones.
+    uses_vertex_color = any(bool(material.get('baseColorUseVertexColor', False))
+                            for material in dump['materials'])
+    vertex_color_api = getattr(_C, 'set_vertex_colors_cpu', None)
+    clear_vertex_color_api = getattr(_C, 'clear_vertex_colors_cpu', None)
+    if uses_vertex_color:
+        if vertex_color_api is None or clear_vertex_color_api is None:
+            raise RuntimeError(
+                'This o_voxel native extension does not support vertex colors; '
+                'rebuild o-voxel from the current source tree'
+            )
+        selected_colors = scene_buffers['vertex_colors'].clone()
+        material_mask = torch.zeros_like(scene_buffers['material_ids'], dtype=torch.bool)
+        for material_index, material in enumerate(dump['materials']):
+            if material.get('baseColorUseVertexColor', False):
+                material_mask |= scene_buffers['material_ids'] == material_index
+        selected_colors[~material_mask] = 1.0
+        vertex_color_api(selected_colors.contiguous())
+    elif clear_vertex_color_api is not None:
+        clear_vertex_color_api()
     native_args = [
         voxel_size,
         grid_range,
@@ -696,7 +735,11 @@ def blender_dump_to_volumetric_attr(
             timing,
             add_emission,
         ])
-    out_tuple = native_fn(*native_args)
+    try:
+        out_tuple = native_fn(*native_args)
+    finally:
+        if clear_vertex_color_api is not None:
+            clear_vertex_color_api()
     
     # Post process
     coord = out_tuple[0]
@@ -734,7 +777,9 @@ def blender_dump_to_volumetric_attr(
         # Native records are grouped by XYZ already. O(N), no torch.unique
         # sorting or unused full-PBR quantized buffers for the RGB-only schema.
         return coord, {'base_color': base_color, 'normal': normal,
-                       'confidence': record_confidence(coord), 'topology': out_tuple[7]}
+                       'confidence': record_confidence(coord),
+                       'topology': out_tuple[7],
+                       'alpha': torch.clamp(out_tuple[5] * 255, 0, 255).byte().reshape(-1, 1)}
     attr = {
         "base_color": base_color,
         "metallic": torch.clamp(out_tuple[2] * 255, 0, 255).byte().reshape(-1, 1),

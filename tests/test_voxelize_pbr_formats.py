@@ -100,7 +100,7 @@ def main():
         assert info["region_block_size"] == [2, 2, 2]
         assert info["normal_source"] == "geometry_reoriented_face_v1"
         assert {entry["name"] for entry in info["record_layout"]} == {
-            "base_color", "normal", "confidence", "topology",
+            "base_color", "normal", "confidence", "topology", "alpha",
         }
         assert result["pbrm_config_8"] == voxelize_pbr._expected_vxzm_config(8)
         assert voxelize_pbr._vxzm_config_from_info(info) is not None

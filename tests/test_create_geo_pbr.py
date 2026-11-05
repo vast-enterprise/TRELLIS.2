@@ -192,10 +192,59 @@ def test_parser_rejects_different_resolutions():
         raise AssertionError("different resolutions must not be intersected")
 
 
+def test_explicit_bos_uri_overrides_uuid_derived_input_key():
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def get_object_to_file(self, bucket, key, destination):
+            self.calls.append((bucket, key, destination))
+            Path(destination).write_bytes(b"glb")
+
+    with tempfile.TemporaryDirectory() as directory:
+        client = Client()
+        destination = Path(directory) / "asset-uuid.glb"
+        key = create_geo_pbr._download_input_glb(
+            client,
+            "vast-model",
+            "ignored-folder",
+            "asset-uuid",
+            destination,
+            "sketchfab_2023_12_18/1927b315be4d4c569247030a737fca95.glb",
+        )
+        assert key == "sketchfab_2023_12_18/1927b315be4d4c569247030a737fca95.glb"
+        assert client.calls == [
+            (
+                "vast-model",
+                "sketchfab_2023_12_18/1927b315be4d4c569247030a737fca95.glb",
+                str(destination),
+            )
+        ]
+        assert destination.read_bytes() == b"glb"
+
+
+def test_explicit_bos_uri_does_not_change_output_or_upload_names():
+    with tempfile.TemporaryDirectory() as directory:
+        parser = create_geo_pbr.build_parser()
+        args = create_geo_pbr._parse_args(parser, [
+            "00002126-be87-4554-9633-8552616c833f",
+            "--output-dir", directory,
+            "--bos-bucket", "vast-model",
+            "--bos-uri", "sketchfab_2023_12_18/1927b315be4d4c569247030a737fca95.glb",
+        ])
+        assert args.bos_uri.endswith("1927b315be4d4c569247030a737fca95.glb")
+        assert args.output_path.name == "00002126-be87-4554-9633-8552616c833f.vxz"
+        assert create_geo_pbr._default_upload_key(
+            "sample_vxz/texture", args.uuid, args.output_path
+        ) == "sample_vxz/texture/00/00002126-be87-4554-9633-8552616c833f.vxz"
+
+
 if __name__ == "__main__":
     test_vxz_intersection_filters_both_coordinate_and_attribute_rows()
     test_geometry_uses_repository_dual_grid_quantization()
     test_bos_upload_uses_texture_and_geometry_subfolders()
     test_failed_upload_removes_all_local_artifacts()
     test_parser_rejects_different_resolutions()
+    test_explicit_bos_uri_overrides_uuid_derived_input_key()
+    test_explicit_bos_uri_does_not_change_output_or_upload_names()
     print("create_geo_pbr tests passed")

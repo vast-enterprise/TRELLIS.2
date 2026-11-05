@@ -14,7 +14,9 @@ Typical usage::
         --resolution 1024 --output-format vxzm
 
 Use ``--visualize`` to write a colored PLY directly without creating a VXZ or
-VXZM file.  With ``--upload``, every local source, intermediate and output
+VXZM file.  Use ``--flip-front-back`` to rotate mesh vertices and normals
+180 degrees around Blender's +Z axis before voxelization.
+With ``--upload``, every local source, intermediate and output
 artifact is temporary and is removed even when conversion or upload fails.
 BOS credentials are read from the environment by default:
 ``BOS_ACCESS_KEY_ID`` and ``BOS_SECRET_ACCESS_KEY``.
@@ -319,6 +321,14 @@ def convert_dump(
     """Convert a PBR dump and return ``(final_path, number_of_records)``."""
     import o_voxel
 
+    if getattr(args, 'store_mesh', False) and (args.output_format != 'vxzm' or args.visualize):
+        raise ValueError('--store-mesh requires VXZM output (without --visualize)')
+    if getattr(args, 'flip_front_back', False):
+        # Import lazily: create_geo_pbr itself imports this module for shared
+        # pipeline helpers.  Rotate both vertices and normals in the same frame.
+        from create_geo_pbr import rotate_dump_geometry
+
+        rotate_dump_geometry(dump, (0.0, 0.0, 180.0))
     normalize_dump_geometry(dump)
 
     common = {
@@ -344,8 +354,17 @@ def convert_dump(
     geometry_normals = dump.get('surface_normal_source') == 'blender_geometry_reoriented_face_world_v1'
     if getattr(args, 'pure_vxzm', False) and not geometry_normals:
         from o_voxel.convert.volumetic_attr import record_confidence
+        alpha = attr.get('alpha')
         attr = {name: attr[name] for name in ('base_color', 'normal')} | {
             'confidence': record_confidence(coord)}
+        if alpha is not None:
+            # Keep alpha as an auxiliary visibility target in pure VXZM.  It
+            # is intentionally absent from the RGB head input.
+            attr['alpha'] = alpha
+    # Alpha is an auxiliary visibility target for the VAE. Keep it in VXZM;
+    # the RGB head remains three-channel and uses alpha only as a loss weight.
+    if args.output_format == 'vxzm' and 'alpha' not in attr:
+        raise RuntimeError('VXZM conversion must return alpha for RGB/alpha-consistent VAE supervision')
     if coord.ndim != 2 or coord.shape[1] != 3 or coord.shape[0] == 0:
         raise RuntimeError(f"Voxelizer returned invalid coordinates: {tuple(coord.shape)}")
     if args.visualize:
@@ -370,6 +389,7 @@ def convert_dump(
             compression_level=args.compression_level,
         )
     else:
+        mesh = o_voxel.convert.mesh_from_dump(dump) if getattr(args, 'store_mesh', False) else None
         o_voxel.io.write_vxzm(
             str(output_path), coord, attr,
             grid_size=args.resolution,
@@ -385,6 +405,7 @@ def convert_dump(
                       'merge_weight': 'closest_point_gaussian_voxel_v1'},
             normal_source=('geometry_reoriented_face_v1' if geometry_normals
                            else 'surface_authored_with_winding_guard'),
+            **(dict(mesh_vertices=mesh[0], mesh_faces=mesh[1]) if mesh is not None else {}),
         )
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError(f"O-Voxel writer did not produce {output_path}")
@@ -403,11 +424,15 @@ def build_parser(pure_vxzm=False) -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None,
                         help="Final local path; otherwise <output-dir>/<uuid>.<suffix>")
     parser.add_argument("--blender", default="blender", help="Blender executable")
+    parser.add_argument("--flip-front-back", action="store_true",
+                        help="Rotate mesh vertices and normals 180 degrees around Blender's +Z before voxelization")
     parser.add_argument("--resolution", type=int, default=1024)
     if not pure_vxzm:
         parser.add_argument("--output-format", "--format", dest="output_format",
                             choices=("vxz", "vxzm"), default="vxz")
     parser.add_argument('--renormal', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--store-mesh', action=argparse.BooleanOptionalAction, default=False,
+                        help='Include normalized mesh vertices/faces in VXZM for VAE validation (default: off)')
     parser.add_argument('--merge-distance', type=float, default=1e-7)
     parser.add_argument('--max-edge-faces', type=_non_negative_int, default=0,
                         help='0 allows all edge degrees; 2 is strict; 3 allows three-face junctions')
@@ -452,7 +477,7 @@ def build_parser(pure_vxzm=False) -> argparse.ArgumentParser:
                         help="Replace an existing local output")
     parser.set_defaults(pure_vxzm=pure_vxzm)
     if pure_vxzm:
-        parser.description = 'Download a GLB by UUID and write only RGB/normal/confidence/topology VXZM.'
+        parser.description = 'Download a GLB by UUID and write RGB/normal/confidence/alpha/topology VXZM.'
         parser.set_defaults(output_format='vxzm', visualize=False,
                             output_dir=Path('./vxzm_outputs'),
                             upload_folder=os.getenv('BOS_OUTPUT_FOLDER', 'sample_vxzm'))
@@ -468,6 +493,8 @@ def main(argv: Optional[list[str]] = None, *, pure_vxzm=False) -> int:
         parser.error("positional uuid and --uuid must match")
     if args.uuid is None:
         parser.error("a GLB uuid is required (positional argument or --uuid)")
+    if args.store_mesh and (args.output_format != 'vxzm' or args.visualize):
+        parser.error('--store-mesh requires VXZM output (without --visualize)')
     import math
     if not math.isfinite(args.merge_distance) or args.merge_distance < 0:
         parser.error('--merge-distance must be finite and non-negative')

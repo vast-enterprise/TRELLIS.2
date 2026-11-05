@@ -57,6 +57,50 @@ After downloading, update the metadata registry:
 python data_toolkit/build_metadata.py ObjaverseXL --root datasets/ObjaverseXL_sketchfab
 ```
 
+### Local inputs, vertex colors and optional VXZM mesh
+
+The Blender dump assigns a default Principled material to missing material
+slots/faces and exports color attributes used by the base-color graph.
+Voxelization interpolates per-corner RGBA and multiplies it with material and
+texture values. Rebuild `o-voxel` after updating the native sampler, and
+regenerate dumps to include vertex colors.
+
+From the repository root, convert a local GLB without BOS credentials:
+
+```bash
+python create_geo_pbr_local.py asset --glb /path/model.glb \
+  --output-dir local_outputs --rotation-degrees 0 0 -90
+# Save only the transformed Blender dump.
+python create_geo_pbr_local.py asset --glb /path/model.glb \
+  --output-dir dump_outputs --flip-front-back --pkl-only
+# Embed the normalized source mesh alongside VXZM records.
+python create_geo_pbr_local.py asset --glb /path/model.glb \
+  --output-dir mesh_outputs --output-format vxzm --store-mesh
+```
+
+The local entry shares the geometry/PBR intersection pipeline and keeps
+geometric-normal repair enabled. The input GLB is always retained. BOS
+credentials are needed only with `--upload`; generated cache/output files are
+then temporary, following the remote entry's cleanup behavior. `--pkl-only`
+cannot be combined with upload, visualization or mesh storage.
+
+`create_geo_pbr.py --bos-uri folder/model.glb` selects an exact object key in
+`--bos-bucket`, while output naming still uses the UUID. Both geometry/PBR
+entries support `--rotation-degrees X Y Z` (`Rz @ Ry @ Rx`) or
+`--flip-front-back` (180 degrees around Blender's +Z), rotating normals and
+vertices together. `create_vxz.py` and `create_vxzm.py` also accept the flip.
+
+`--store-mesh` is off by default and is available on all three remote creation
+scripts, the local entry, and batch `voxelize_pbr.py`. It requires VXZM output
+(or `both` for the batch entry) without PLY visualization. Mesh vertices/faces
+are stored separately from records and retain the normalized sampling frame.
+
+Canonical VXZM records now include `alpha[1]`. Update readers before loading
+new files; old alpha-free files remain readable. The batch cache signature
+includes alpha and mesh-storage settings. Changes to source materials or
+vertex colors still require regenerating the dump and affected voxel cache.
+This update preserves alpha as data; it does not change training losses.
+
 ### Step 4: Process Mesh and PBR Textures
 
 Standardize 3D assets by dumping mesh and PBR textures.
@@ -125,11 +169,10 @@ multiple records at one fine voxel when their signed surface-normal angle is
 greater than 15 degrees. Existing `.vxz` output remains the default and is
 unchanged. Generate either or both formats with:
 
-VXZM requires PBR dumps produced by the current `dump_pbr.py`, which preserves
-Blender-authored corner normals in world space. Legacy dumps without the
-`surface_normal_source=blender_authored_corner_world_v1` marker are rejected;
-re-run the PBR dump stage for those GLBs. This check applies only to VXZM, so
-the existing VXZ path remains compatible with older dumps.
+The bulk VXZM path requires current `dump_pbr.py` dumps with
+`surface_normal_source=blender_geometry_reoriented_face_world_v1` and triangle
+topology. Re-normal is enabled by default. Re-run the dump stage for older
+caches; the existing VXZ path remains compatible with older dumps.
 
 ```bash
 python data_toolkit/voxelize_pbr.py ObjaverseXL \
@@ -141,8 +184,8 @@ python data_toolkit/voxelize_pbr.py ObjaverseXL \
 
 At 1024 resolution, each occupied leaf of the 256-resolution coarse SVO owns
 a 4x4x4 local block. Its record count, byte offset, local positions, colors,
-surface normals, metallic, roughness, emissive, and alpha attributes are
-stored independently. See
+geometry normals, confidence, topology, and alpha attributes are stored.
+Full PBR material attributes remain available in the dump and VXZ output. See
 `o-voxel/VXZM_FORMAT.md` for the binary layout. A standalone conversion and
 PLY visualization test is available as:
 

@@ -77,6 +77,20 @@ def main():
         assert info["region_block_size"] == [4, 4, 4]
         assert info["normal_source"] == "surface_authored_with_winding_guard"
         assert info["metadata"]["cluster_angle_degrees"] == 15.0
+        # Optional training mesh uses the same normalized frame and is kept
+        # separate from per-record attributes.  The default path stays mesh-free.
+        vertices = np.asarray([[-.2, -.2, 0.0], [.2, -.2, 0.0], [0.0, .2, 0.0]], np.float32)
+        faces = np.asarray([[0, 1, 2]], np.int32)
+        mesh_path = Path(td) / "mesh.vxzm"
+        o_voxel.io.write_vxzm(mesh_path, shuffled_coord, shuffled_attr, grid_size=1024,
+                              region_resolution=256, compression="none",
+                              mesh_vertices=vertices, mesh_faces=faces)
+        mesh_info = o_voxel.io.read_vxzm_info(mesh_path)
+        assert mesh_info["mesh"]["storage"] == "normalized_triangle_mesh_v1"
+        got_mesh = o_voxel.io.read_vxzm_mesh(mesh_path)
+        np.testing.assert_array_equal(got_mesh[0], vertices)
+        np.testing.assert_array_equal(got_mesh[1], faces)
+        assert o_voxel.io.read_vxzm_mesh(path) is None
         region_coord, region_counts, region_offsets, region_info = \
             o_voxel.io.read_vxzm_regions(path)
         assert region_info == info

@@ -57,7 +57,7 @@ def test_converter_and_pure_cli():
     dump = fixture_dump()
     coord, attr = o_voxel.convert.blender_dump_to_volumetric_attr_multi(
         dump, grid_size=8, aabb=[[-.5]*3,[.5]*3], color_space='linear')
-    assert set(attr) == {'base_color','normal','confidence','topology'}
+    assert set(attr) == {'base_color','normal','confidence','topology','alpha'}
     assert torch.all(attr['confidence'] == 255)
     assert torch.all(attr['normal'][:,2] == 255)
     args = create_vxzm.build_parser().parse_args(['asset'])
@@ -114,7 +114,7 @@ def test_topology_preserves_samples():
     other_coord, unmarked = o_voxel.convert.blender_dump_to_volumetric_attr_multi(
         dump, grid_size=8, aabb=[[-.5]*3,[.5]*3], color_space='linear')
     assert torch.equal(coord, other_coord)
-    for name in ('base_color', 'normal', 'confidence'):
+    for name in ('base_color', 'normal', 'confidence', 'alpha'):
         assert torch.equal(marked[name], unmarked[name])
     assert torch.all(unmarked['topology'] == 0)
     # Flag provenance follows each normal cluster, not every record at XYZ.

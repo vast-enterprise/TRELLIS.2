@@ -12,6 +12,11 @@
 #pragma once
 #include <torch/extension.h>
 
+// Optional glTF COLOR_0 per-triangle-corner data used by the PBR sampler.
+// Callers must clear it after voxelization; an empty tensor disables it.
+void set_vertex_colors_cpu(const torch::Tensor& colors);
+void clear_vertex_colors_cpu();
+
 
 /**
  * Extract flexible dual grid from a triangle mesh.

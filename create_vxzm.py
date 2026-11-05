@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Create a pure RGB + geometry-normal + confidence + topology VXZM by GLB UUID.
+"""Create an RGB + geometry-normal + confidence + optional alpha/topology VXZM by GLB UUID.
 
 Example:
     python create_vxzm.py UUID --resolution 1024 --output-dir vxzm_outputs
+
+For VAE training/validation, add --store-mesh to embed the normalized triangle
+mesh in the same file. Mesh storage is off by default for all entry points.
 
 Re-normal is enabled by default. --no-renormal is a legacy authored-normal
 comparison mode, marked VXZM v0. Only .vxzm is written; no VXZ/PLY output.
