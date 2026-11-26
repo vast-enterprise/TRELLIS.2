@@ -44,6 +44,7 @@ setup(
                 "src/hash/hash.cu",
                 # Convert functions
                 "src/convert/flexible_dual_grid.cpp",
+                "src/convert/flexible_dual_grid_cuda.cu",
                 "src/convert/volumetic_attr.cpp",
                 ## Serialization functions
                 "src/serialize/api.cu",
@@ -64,7 +65,7 @@ setup(
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3","-std=c++17"] + cc_flag,
+                "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr", "--fmad=false"] + cc_flag,
             }
         )
     ],

@@ -6,7 +6,11 @@ Example:
 
 Use --pkl-only to save only the transformed Blender dump. Geometry-normal
 repair is enabled by the shared Blender helper. BOS credentials are required
-only with --upload; the supplied GLB is always retained.
+only with --upload; the supplied GLB is always retained. ``--geometry-only``
+disables material/UV export and weld/normal repair, writing only geometry VXZ.
+It reads static GLB geometry directly; --geometry-loader blender forces Blender,
+and --geometry-loader glb disables fallback for unsupported GLB features.
+Use ``--geometry-backend cpu`` to reproduce legacy float32 geometry values.
 """
 from typing import Optional
 

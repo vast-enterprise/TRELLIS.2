@@ -50,7 +50,7 @@ def init_scene() -> None:
         bpy.data.images.remove(image, do_unlink=True)
 
 
-def load_object(object_path: str) -> None:
+def load_object(object_path: str, merge_vertices: bool = True) -> None:
     """Loads a model with a supported file extension into the scene.
 
     Args:
@@ -87,7 +87,7 @@ def load_object(object_path: str) -> None:
     if file_extension == "blend":
         import_function(directory=object_path, link=False)
     elif file_extension in {"glb", "gltf"}:
-        import_function(filepath=object_path, merge_vertices=True, import_shading='NORMALS', bone_heuristic='TEMPERANCE')
+        import_function(filepath=object_path, merge_vertices=merge_vertices, import_shading='NORMALS', bone_heuristic='TEMPERANCE')
     else:
         import_function(filepath=object_path)
         
@@ -452,18 +452,24 @@ def ensure_default_materials():
                 face.material_index = fallback_index
 
 
-def main(arg):    
+def main(arg):
+    arg.geometry_only = getattr(arg, "geometry_only", False)
+    if arg.geometry_only:
+        arg.renormal = False
+        arg.merge_distance = 0.0
     # Initialize context
     if arg.object.endswith(".blend"):
         delete_invisible_objects()
     else:
         init_scene()
-        load_object(arg.object)
+        load_object(arg.object, merge_vertices=not arg.geometry_only)
     print('[INFO] Scene initialized.')
 
     # Material IDs are indices into bpy.data.materials, so create fallbacks
-    # before serializing that collection or evaluating the mesh.
-    ensure_default_materials()
+    # before serializing that collection or evaluating the mesh. Geometry-only
+    # mode intentionally skips all material/normal/UV work for benchmarking.
+    if not arg.geometry_only:
+        ensure_default_materials()
     
     # Normalize scene
     scale, offset = normalize_scene()
@@ -475,6 +481,7 @@ def main(arg):
     output = {
         'materials': [],
         'objects': [],
+        'geometry_only': arg.geometry_only,
         # File-level provenance prevents geometry/authored caches being mixed.
         'surface_normal_source': NORMAL_SOURCE if arg.renormal else 'blender_authored_corner_world_v1',
         'normal_preprocessing': {'renormal': arg.renormal, 'merge_distance': arg.merge_distance,
@@ -483,7 +490,7 @@ def main(arg):
     }
 
     # Dumping materials
-    for mat in bpy.data.materials:
+    for mat in ([] if arg.geometry_only else bpy.data.materials):
         assert mat.use_nodes == True, "Material is not supported"
 
         pack = {
@@ -668,62 +675,64 @@ def main(arg):
         eval_mesh = eval_obj.to_mesh()
         try:
             world_matrix = eval_obj.matrix_world.copy()
-            if arg.renormal:
+            if arg.renormal and not arg.geometry_only:
                 stats = clean_geometry(eval_mesh, world_matrix, arg.merge_distance, arg.max_edge_faces)
                 print(f"[INFO] Re-normal {obj.name}: {stats}", flush=True)
                 pack['normal_preprocessing'] = stats
             eval_mesh.calc_loop_triangles()
-            triangles = list(eval_mesh.loop_triangles)
-            pack["vertices"] = np.asarray([
-                v.co[:] if arg.renormal else (world_matrix @ v.co)[:]
-                for v in eval_mesh.vertices
-            ], dtype=np.float32).reshape(-1, 3)
-            pack["faces"] = np.asarray([
-                list(triangle.vertices) for triangle in triangles
-            ], dtype=np.int32).reshape(-1, 3)
+            # foreach_get avoids millions of Python RNA wrapper allocations.
+            triangles = eval_mesh.loop_triangles
+            pack["vertices"] = np.empty((len(eval_mesh.vertices), 3), dtype=np.float32)
+            eval_mesh.vertices.foreach_get('co', pack['vertices'].ravel())
+            if not arg.renormal:
+                matrix = np.asarray(world_matrix, dtype=np.float32)
+                pack['vertices'] = pack['vertices'] @ matrix[:3, :3].T + matrix[:3, 3]
+            pack["faces"] = np.empty((len(triangles), 3), dtype=np.int32)
+            triangles.foreach_get('vertices', pack['faces'].ravel())
+            if arg.geometry_only:
+                output['objects'].append(pack)
+                continue
+            loops = np.empty((len(triangles), 3), dtype=np.int32)
+            triangles.foreach_get('loops', loops.ravel())
             if arg.renormal:
                 pack["normals"] = triangle_normals(pack["vertices"], pack["faces"])
-                pack['topology'] = triangle_topology(eval_mesh)
+                pack['topology'] = triangle_topology(eval_mesh, faces=pack['faces'])
             else:
-                # Blender >=4.1 removed calc_normals_split; corner_normals
-                # is evaluated lazily. Keep authored semantics only on opt-out.
                 if hasattr(eval_mesh, 'calc_normals_split'):
                     eval_mesh.calc_normals_split()
-                normal_matrix = world_matrix.to_3x3().inverted_safe().transposed()
-                transformed_normals = []
-                for triangle in triangles:
-                    row = []
-                    for loop_index in triangle.loops:
-                        n = normal_matrix @ eval_mesh.corner_normals[loop_index].vector
-                        if n.length_squared > 1e-20:
-                            n.normalize()
-                        row.append(n[:])
-                    transformed_normals.append(row)
-                pack['normals'] = np.asarray(transformed_normals, dtype=np.float32).reshape(-1, 3, 3)
+                normals = np.empty((len(eval_mesh.loops), 3), dtype=np.float32)
+                if hasattr(eval_mesh, 'corner_normals'):
+                    eval_mesh.corner_normals.foreach_get('vector', normals.ravel())
+                else:
+                    eval_mesh.loops.foreach_get('normal', normals.ravel())
+                matrix = np.asarray(world_matrix.to_3x3().inverted_safe().transposed(), dtype=np.float32)
+                normals = normals @ matrix.T
+                lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+                np.divide(normals, lengths, out=normals, where=lengths > 1e-10)
+                pack['normals'] = normals[loops]
 
             if eval_mesh.uv_layers.active is not None:
                 uv_data = eval_mesh.uv_layers.active.data
-                pack["uvs"] = np.array([
-                    [uv_data[i].uv for i in triangle.loops]
-                    for triangle in triangles
-                ], dtype=np.float32).reshape(-1, 3, 2)  # (F, 3, 2)
+                uvs = np.empty((len(uv_data), 2), dtype=np.float32)
+                uv_data.foreach_get('uv', uvs.ravel())
+                pack["uvs"] = uvs[loops]
 
-            pack["mat_ids"] = np.array([
-                bpy.data.materials.find(obj.material_slots[triangle.material_index].name)
-                if (triangle.material_index < len(obj.material_slots) and
-                    obj.material_slots[triangle.material_index].material is not None)
-                else -1
-                for triangle in triangles
+            slot_ids = np.asarray([
+                bpy.data.materials.find(slot.name) if slot.material is not None else -1
+                for slot in obj.material_slots
             ], dtype=np.int32)
+            material_ids = np.empty(len(triangles), dtype=np.int32)
+            triangles.foreach_get('material_index', material_ids)
+            pack['mat_ids'] = np.full(len(triangles), -1, dtype=np.int32)
+            valid = (material_ids >= 0) & (material_ids < len(slot_ids))
+            pack['mat_ids'][valid] = slot_ids[material_ids[valid]]
 
             # Preserve glTF COLOR_0 per-corner data.  Blender exposes imported
             # vertex colors through color_attributes; both CORNER (the usual
             # glTF representation) and POINT domains are supported.  Store
             # RGBA float values in triangle-loop order so the voxelizer can
             # interpolate them at the same surface query as UV/base color.
-            object_material_ids = {
-                int(value) for value in np.asarray(pack['mat_ids']).reshape(-1)
-            }
+            object_material_ids = np.unique(pack['mat_ids'])
             object_requires_color = any(
                 0 <= value < len(output['materials']) and
                 output['materials'][value].get('baseColorUseVertexColor', False)
@@ -734,13 +743,12 @@ def main(arg):
                 layers_by_name = {layer.name.upper(): layer for layer in color_attributes}
                 semantic_layer = next((layer for layer in color_attributes
                                        if layer.name.upper() in {'COLOR_0', 'COLOR', 'COL'}), None)
-                colors = []
-                for triangle_index, triangle in enumerate(triangles):
-                    material_index = int(pack['mat_ids'][triangle_index])
+                colors = np.ones((len(triangles), 3, 4), dtype=np.float32)
+                layer_cache = {}
+                for material_index in np.unique(pack['mat_ids']):
                     material = (output['materials'][material_index]
                                 if 0 <= material_index < len(output['materials']) else None)
                     if material is None or not material.get('baseColorUseVertexColor', False):
-                        colors.append([[1.0, 1.0, 1.0, 1.0]] * 3)
                         continue
                     requested = material.get('baseColorVertexColorLayer')
                     color_layer = (layers_by_name.get(str(requested).upper())
@@ -748,17 +756,15 @@ def main(arg):
                     if color_layer is None and requested and str(requested).upper() in {'COLOR_0', 'COLOR', 'COL'}:
                         color_layer = semantic_layer
                     if color_layer is None:
-                        raise RuntimeError(
-                            f'Vertex color layer {requested!r} is missing from mesh'
-                        )
-                    row = []
-                    for loop_index, vertex_index in zip(triangle.loops, triangle.vertices):
-                        data_index = loop_index if color_layer.domain == 'CORNER' else vertex_index
-                        value = color_layer.data[data_index].color
-                        row.append([float(value[0]), float(value[1]), float(value[2]),
-                                    float(value[3]) if len(value) > 3 else 1.0])
-                    colors.append(row)
-                pack['vertex_colors'] = np.asarray(colors, dtype=np.float32).reshape(-1, 3, 4)
+                        raise RuntimeError(f'Vertex color layer {requested!r} is missing from mesh')
+                    if color_layer.name not in layer_cache:
+                        values = np.empty((len(color_layer.data), 4), dtype=np.float32)
+                        color_layer.data.foreach_get('color', values.ravel())
+                        layer_cache[color_layer.name] = values
+                    mask = pack['mat_ids'] == material_index
+                    indices = loops[mask] if color_layer.domain == 'CORNER' else pack['faces'][mask]
+                    colors[mask] = layer_cache[color_layer.name][indices]
+                pack['vertex_colors'] = colors
             else:
                 pack['vertex_colors'] = None
 
@@ -769,12 +775,14 @@ def main(arg):
     # Save output
     os.makedirs(os.path.dirname(arg.output_path), exist_ok=True)
     with open(arg.output_path, 'wb') as f:
-        pickle.dump(output, f)
+        pickle.dump(output, f, protocol=pickle.HIGHEST_PROTOCOL)
     print('[INFO] Output saved to {}.'.format(arg.output_path))
 
         
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Renders given obj file by rotation a camera around it.')
+    parser.add_argument('--geometry-only', action='store_true',
+                        help='Export only normalized vertices/faces; skip weld, normals, UVs and materials')
     parser.add_argument('--renormal', action=argparse.BooleanOptionalAction, default=True,
                         help='Repair winding and export geometry normals (default: enabled)')
     parser.add_argument('--merge-distance', type=float, default=1e-7,
@@ -785,6 +793,9 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str, default='/tmp', help='The path the output will be dumped to.')
     argv = sys.argv[sys.argv.index("--") + 1:]
     args = parser.parse_args(argv)
+    if args.geometry_only:
+        args.renormal = False
+        args.merge_distance = 0.0
 
     # Failed runs must not leave a previous dump that a caller could reuse.
     if os.path.exists(args.output_path):

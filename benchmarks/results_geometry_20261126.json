@@ -1,0 +1,368 @@
+{
+  "studio_000": {
+    "benchmark": {
+      "mesh": "/mnt/pfs/users/chenjiahao/studio_000.glb",
+      "resolution": 1024,
+      "torch": "2.7.0+cu126",
+      "cuda": "12.6",
+      "gpu": "NVIDIA A100-SXM4-80GB",
+      "timings": {
+        "reference_dump_seconds": 21.844098145142198,
+        "optimized_dump_seconds": 13.526117119938135,
+        "prepare_seconds": 0.24378393590450287,
+        "cpu_sampling_seconds": [
+          19.902555430307984,
+          19.7342247357592,
+          19.449271663092077
+        ],
+        "cuda_sampling_seconds": [
+          0.14635841734707355,
+          0.10764135140925646,
+          0.09194198250770569
+        ],
+        "cpu_convert_geometry_seconds": [
+          19.41780678462237,
+          20.223020557314157,
+          19.788665959611535
+        ],
+        "cuda_convert_geometry_seconds": [
+          0.16330518759787083,
+          0.165237158536911,
+          0.14490409288555384
+        ]
+      },
+      "dump_comparison": {
+        "object_count_equal": true,
+        "faces_exact": true,
+        "vertices_max_abs": 0.0
+      },
+      "triangles": 4739690,
+      "cpu_peak_cuda_bytes": 0,
+      "cuda_peak_cuda_bytes": 2145452032,
+      "comparison": {
+        "cpu_voxels": 6666264,
+        "cuda_voxels": 6666264,
+        "common_voxels": 6666264,
+        "coordinate_sets_equal": true,
+        "intersection_flag_mismatches": 0,
+        "position_abs_error_voxels_mean": 0.004905287176370621,
+        "position_abs_error_voxels_p99": 0.08436721801757585,
+        "position_abs_error_voxels_max": 1.0,
+        "quantized_vertices_equal_fraction": 0.4214496910572052
+      },
+      "sampling_speedup": 183.33311945080413
+    },
+    "pipeline_fresh_normalization": {
+      "cpu_convert_geometry_seconds": [
+        19.85596575215459,
+        19.799291559495032,
+        20.03784575778991
+      ],
+      "cuda_convert_geometry_seconds": [
+        0.35761013999581337,
+        0.31392234843224287,
+        0.30666590202599764
+      ]
+    },
+    "qef_audit": {
+      "sample_count": 75982,
+      "voxels_error_over_quarter": 75982,
+      "cuda_energy_lower_fraction": 1.0,
+      "cpu_minus_cuda_energy_min": 1.414720543010591e-09,
+      "cpu_minus_cuda_energy_mean": 6.124206916175894e-08,
+      "cpu_minus_cuda_energy_max": 1.587795523130523e-06,
+      "error_voxels_over_half": 25301,
+      "error_voxels_max": 1.0
+    },
+    "join": {
+      "geometry_rows": 6666264,
+      "query_rows": 7999516,
+      "cpu_seconds": [
+        1.2739886464551091,
+        1.2681313380599022,
+        1.270814129151404
+      ],
+      "cuda_seconds": [
+        0.18443850800395012,
+        0.1350360121577978,
+        0.13403852563351393
+      ],
+      "exact": true,
+      "speedup": 9.410927565502899
+    },
+    "artifacts": "/mnt/pfs/users/chenjiahao/geometry_benchmark_20261126/final/studio_000",
+    "direct_loader": {
+      "mesh": "/mnt/pfs/users/chenjiahao/studio_000.glb",
+      "resolution": 1024,
+      "gpu": "NVIDIA A100-SXM4-80GB",
+      "torch": "2.7.0+cu126",
+      "repeats": 3,
+      "timings": {
+        "blender": {
+          "load_seconds": [
+            13.81168766785413,
+            13.665544528514147,
+            13.268365120515227
+          ],
+          "convert_seconds": [
+            0.39022713899612427,
+            0.3604392511770129,
+            0.3524581203237176
+          ],
+          "total_seconds": [
+            14.201914806850255,
+            14.02598377969116,
+            13.620823240838945
+          ],
+          "median_load_seconds": 13.665544528514147,
+          "median_total_seconds": 14.02598377969116
+        },
+        "glb": {
+          "load_seconds": [
+            0.2880101278424263,
+            0.2799782333895564,
+            0.28645388036966324
+          ],
+          "convert_seconds": [
+            0.34198569785803556,
+            0.32298120856285095,
+            0.3193946033716202
+          ],
+          "total_seconds": [
+            0.6299958257004619,
+            0.6029594419524074,
+            0.6058484837412834
+          ],
+          "median_load_seconds": 0.28645388036966324,
+          "median_total_seconds": 0.6058484837412834
+        }
+      },
+      "input": {
+        "triangles": 4739690,
+        "vertices": 2526773,
+        "objects_equal": true,
+        "faces_exact": true,
+        "vertices_exact": true,
+        "vertices_max_abs_difference": 0.0
+      },
+      "comparison": {
+        "blender_voxels": 6666264,
+        "direct_voxels": 6666264,
+        "common_voxels": 6666264,
+        "coordinates_exact": true,
+        "intersection_flag_mismatches": 0,
+        "quantized_vertices_exact": true,
+        "quantized_vertex_mismatch_rows": 0,
+        "quantized_vertex_max_abs_difference": 0
+      },
+      "speedup": 23.150976120426673
+    },
+    "direct_loader_cli": {
+      "command": [
+        "/opt/venvs/trellis2vxzpp-geometry/bin/python",
+        "create_geo_pbr_local.py",
+        "studio_000",
+        "--glb",
+        "/mnt/pfs/users/chenjiahao/studio_000.glb",
+        "--geometry-only",
+        "--geometry-loader",
+        "glb",
+        "--geometry-backend",
+        "cuda",
+        "--blender",
+        "/does-not-exist/blender",
+        "--resolution",
+        "1024",
+        "--timing",
+        "--output-dir",
+        "/mnt/pfs/users/chenjiahao/geometry_benchmark_20261126/direct_cli"
+      ],
+      "process_wall_seconds_including_startup_and_vxz_write": 5.180869271047413,
+      "vxz_readback_exact": true,
+      "bytes": 21066035
+    }
+  },
+  "studio_001": {
+    "benchmark": {
+      "mesh": "/mnt/pfs/users/chenjiahao/studio_001.glb",
+      "resolution": 1024,
+      "torch": "2.7.0+cu126",
+      "cuda": "12.6",
+      "gpu": "NVIDIA A100-SXM4-80GB",
+      "timings": {
+        "reference_dump_seconds": 21.590930736623704,
+        "optimized_dump_seconds": 13.76794851757586,
+        "prepare_seconds": 0.24365543853491545,
+        "cpu_sampling_seconds": [
+          11.885759829543531,
+          12.25813208706677,
+          11.877161305397749
+        ],
+        "cuda_sampling_seconds": [
+          0.05565272364765406,
+          0.04154859110713005,
+          0.04141930863261223
+        ],
+        "cpu_convert_geometry_seconds": [
+          12.02729370445013,
+          11.861261876299977,
+          12.128357137553394
+        ],
+        "cuda_convert_geometry_seconds": [
+          0.1364890392869711,
+          0.0982136046513915,
+          0.09841573797166348
+        ]
+      },
+      "dump_comparison": {
+        "object_count_equal": true,
+        "faces_exact": true,
+        "vertices_max_abs": 0.0
+      },
+      "triangles": 4967794,
+      "cpu_peak_cuda_bytes": 0,
+      "cuda_peak_cuda_bytes": 1316007936,
+      "comparison": {
+        "cpu_voxels": 2319144,
+        "cuda_voxels": 2319144,
+        "common_voxels": 2319144,
+        "coordinate_sets_equal": true,
+        "intersection_flag_mismatches": 0,
+        "position_abs_error_voxels_mean": 0.004221750423312187,
+        "position_abs_error_voxels_p99": 0.02606201171875,
+        "position_abs_error_voxels_max": 1.0,
+        "quantized_vertices_equal_fraction": 0.183721661567688
+      },
+      "sampling_speedup": 286.0689018045631
+    },
+    "pipeline_fresh_normalization": {
+      "cpu_convert_geometry_seconds": [
+        12.071827759034932,
+        12.30180876236409,
+        12.086952661164105
+      ],
+      "cuda_convert_geometry_seconds": [
+        0.2940802201628685,
+        0.255724566988647,
+        0.25699652824550867
+      ]
+    },
+    "qef_audit": {
+      "sample_count": 4622,
+      "voxels_error_over_quarter": 4622,
+      "cuda_energy_lower_fraction": 1.0,
+      "cpu_minus_cuda_energy_min": 1.3016813162628866e-09,
+      "cpu_minus_cuda_energy_mean": 8.13623206341979e-08,
+      "cpu_minus_cuda_energy_max": 1.713143022417235e-06,
+      "error_voxels_over_half": 1684,
+      "error_voxels_max": 1.0
+    },
+    "join": {
+      "geometry_rows": 2319144,
+      "query_rows": 2782972,
+      "cpu_seconds": [
+        0.45308895502239466,
+        0.416090477257967,
+        0.402312520891428
+      ],
+      "cuda_seconds": [
+        0.07618043757975101,
+        0.0376836908981204,
+        0.037576899863779545
+      ],
+      "exact": true,
+      "speedup": 11.041659331695687
+    },
+    "artifacts": "/mnt/pfs/users/chenjiahao/geometry_benchmark_20261126/final/studio_001",
+    "direct_loader": {
+      "mesh": "/mnt/pfs/users/chenjiahao/studio_001.glb",
+      "resolution": 1024,
+      "gpu": "NVIDIA A100-SXM4-80GB",
+      "torch": "2.7.0+cu126",
+      "repeats": 3,
+      "timings": {
+        "blender": {
+          "load_seconds": [
+            13.998106768354774,
+            13.862384593114257,
+            14.003969138488173
+          ],
+          "convert_seconds": [
+            0.28826630488038063,
+            0.27562361396849155,
+            0.27731870487332344
+          ],
+          "total_seconds": [
+            14.286373073235154,
+            14.138008207082748,
+            14.281287843361497
+          ],
+          "median_load_seconds": 13.998106768354774,
+          "median_total_seconds": 14.281287843361497
+        },
+        "glb": {
+          "load_seconds": [
+            0.2822544379159808,
+            0.2894925493746996,
+            0.2795045915991068
+          ],
+          "convert_seconds": [
+            0.2799873314797878,
+            0.27919240295886993,
+            0.28391159418970346
+          ],
+          "total_seconds": [
+            0.5622417693957686,
+            0.5686849523335695,
+            0.5634161857888103
+          ],
+          "median_load_seconds": 0.2822544379159808,
+          "median_total_seconds": 0.5634161857888103
+        }
+      },
+      "input": {
+        "triangles": 4967794,
+        "vertices": 2516496,
+        "objects_equal": true,
+        "faces_exact": true,
+        "vertices_exact": true,
+        "vertices_max_abs_difference": 0.0
+      },
+      "comparison": {
+        "blender_voxels": 2319144,
+        "direct_voxels": 2319144,
+        "common_voxels": 2319144,
+        "coordinates_exact": true,
+        "intersection_flag_mismatches": 0,
+        "quantized_vertices_exact": true,
+        "quantized_vertex_mismatch_rows": 0,
+        "quantized_vertex_max_abs_difference": 0
+      },
+      "speedup": 25.3476705206241
+    },
+    "direct_loader_cli": {
+      "command": [
+        "/opt/venvs/trellis2vxzpp-geometry/bin/python",
+        "create_geo_pbr_local.py",
+        "studio_001",
+        "--glb",
+        "/mnt/pfs/users/chenjiahao/studio_001.glb",
+        "--geometry-only",
+        "--geometry-loader",
+        "glb",
+        "--geometry-backend",
+        "cuda",
+        "--blender",
+        "/does-not-exist/blender",
+        "--resolution",
+        "1024",
+        "--timing",
+        "--output-dir",
+        "/mnt/pfs/users/chenjiahao/geometry_benchmark_20261126/direct_cli"
+      ],
+      "process_wall_seconds_including_startup_and_vxz_write": 4.308906563557684,
+      "vxz_readback_exact": true,
+      "bytes": 7357815
+    }
+  }
+}

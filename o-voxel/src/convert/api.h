@@ -226,3 +226,10 @@ textured_mesh_to_volumetric_attr_multi_topology_cpu(
     const int64_t maxTotalRecords,
     const torch::Tensor& triangleTopology
 );
+
+// Sparse CUDA dual-grid phases: mark, intersection QEF, face QEF, boundary QEF.
+void dual_grid_accumulate_cuda(torch::Tensor vertices, torch::Tensor faces, torch::Tensor edges,
+    std::vector<double> size, std::vector<int64_t> grid, torch::Tensor keys, torch::Tensor rows,
+    torch::Tensor data, torch::Tensor flags, torch::Tensor overflow, int phase, double boundary_weight);
+std::tuple<torch::Tensor, torch::Tensor> dual_grid_solve_cuda(torch::Tensor coords,
+    torch::Tensor data, torch::Tensor flags, std::vector<double> size, double regularization_weight);

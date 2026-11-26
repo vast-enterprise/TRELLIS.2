@@ -65,21 +65,17 @@ def orient_manifold_patches(bm):
                 face.normal_flip()
 
 
-def triangle_topology(mesh):
-    """Bit 0: source triangle touches an edge with >2 incident faces.
-
-    This labels the whole contributing triangle, not a geometric distance
-    band around its junction edge. It is provenance, not a validity score.
-    """
-    edge_count = {}
-    for t in mesh.loop_triangles:
-        a,b,c = t.vertices
-        for x,y in ((a,b),(b,c),(c,a)):
-            key = (min(x,y),max(x,y))
-            edge_count[key] = edge_count.get(key,0) + 1
-    return np.asarray([any(edge_count[(min(x,y),max(x,y))] > 2
-                           for x,y in zip(t.vertices, (*t.vertices[1:],t.vertices[0])))
-                       for t in mesh.loop_triangles], dtype=np.uint8)
+def triangle_topology(mesh, faces=None):
+    """Mark triangles touching an edge with >2 incident faces, in bulk."""
+    if faces is None:
+        faces = np.empty((len(mesh.loop_triangles), 3), dtype=np.int32)
+        mesh.loop_triangles.foreach_get('vertices', faces.ravel())
+    edges = np.stack((faces, np.roll(faces, -1, axis=1)), axis=-1)
+    lo = edges.min(axis=-1).astype(np.uint64)
+    hi = edges.max(axis=-1).astype(np.uint64)
+    keys = (lo << np.uint64(32)) | hi
+    _, inverse, counts = np.unique(keys.reshape(-1), return_inverse=True, return_counts=True)
+    return (counts[inverse].reshape(-1, 3) > 2).any(axis=1).astype(np.uint8)
 
 
 def clean_geometry(mesh, world_matrix, merge_distance=1e-7, max_edge_faces=0):

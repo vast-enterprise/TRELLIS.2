@@ -215,7 +215,7 @@ def upload_file(
 
 def run_blender_dump(blender: str, glb_path: Path, dump_path: Path,
                      renormal: bool = True, merge_distance: float = 1e-7,
-                     max_edge_faces: int = 0) -> None:
+                     max_edge_faces: int = 0, geometry_only: bool = False) -> None:
     """Run the repository's Blender PBR dump script."""
     if not DUMP_SCRIPT.is_file():
         raise FileNotFoundError(f"Blender dump script not found: {DUMP_SCRIPT}")
@@ -235,6 +235,8 @@ def run_blender_dump(blender: str, glb_path: Path, dump_path: Path,
     cmd.extend(['--renormal' if renormal else '--no-renormal',
                 '--merge-distance', str(merge_distance),
                 '--max-edge-faces', str(max_edge_faces)])
+    if geometry_only:
+        cmd.append('--geometry-only')
     # A failed Blender process must never cause a stale pickle to be read.
     dump_path.unlink(missing_ok=True)
     print("Running Blender PBR dump:", " ".join(cmd))

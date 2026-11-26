@@ -36,6 +36,7 @@ def mesh_to_flexible_dual_grid(
     boundary_weight: float = 1.0,
     regularization_weight: float = 0.1,
     timing: bool = False,
+    backend: str = "cpu",
 ) -> Union[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Voxelize a mesh into a sparse voxel grid.
@@ -52,6 +53,10 @@ def mesh_to_flexible_dual_grid(
         boundary_weight (float): The weight of the boundary term in the QEF when solving the dual vertices.
         regularization_weight (float): The weight of the regularization term in the QEF when solving the dual vertices.
         timing (bool): Whether to time the voxelization process.
+        backend (str): 'cpu' reference, 'cuda' sparse GPU implementation, or 'auto'.
+            CUDA returns key-sorted GPU tensors and uses double precision QEF
+            accumulation/solving. Coordinates and flags retain scan semantics;
+            dual positions need not be bit-identical to the float32 CPU solve.
         
     Returns:
         torch.Tensor: The indices of the voxels that are occupied by the mesh.
@@ -60,10 +65,14 @@ def mesh_to_flexible_dual_grid(
         torch.Tensor: The intersected flag of each voxel.
     """
     
-    # Load mesh
-    vertices = vertices.float()
-    faces = faces.int()
-
+    if backend not in ('cpu', 'cuda', 'auto'):
+        raise ValueError('backend must be cpu, cuda or auto')
+    if backend == 'auto':
+        backend = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = (vertices.device if vertices.is_cuda else torch.device('cuda')) if backend == 'cuda' else torch.device('cpu')
+    # Keep settings on the same device; CPU native code must never see CUDA pointers.
+    vertices = vertices.to(device=device, dtype=torch.float32)
+    faces = faces.to(device=device, dtype=torch.int32)
     # Voxelize settings
     assert voxel_size is not None or grid_size is not None, "Either voxel_size or grid_size must be provided"
 
@@ -99,6 +108,10 @@ def mesh_to_flexible_dual_grid(
         assert aabb.size(0) == 2, f"aabb must have 2 rows, but got {aabb.size(0)}"
         assert aabb.size(1) == 3, f"aabb must have 3 columns, but got {aabb.size(1)}"
 
+    voxel_size = voxel_size.to(device=device, dtype=torch.float32) if voxel_size is not None else None
+    grid_size = grid_size.to(device=device, dtype=torch.int32) if grid_size is not None else None
+    aabb = aabb.to(device=device, dtype=torch.float32) if aabb is not None else None
+
     # Auto adjust aabb
     if aabb is None:
         min_xyz = vertices.min(dim=0).values
@@ -113,7 +126,7 @@ def mesh_to_flexible_dual_grid(
             min_xyz -= padding * 0.5
             max_xyz += padding * 0.5
 
-        aabb = torch.stack([min_xyz, max_xyz], dim=0).float().cuda()
+        aabb = torch.stack([min_xyz, max_xyz], dim=0).float()
 
     # Fill voxel size or grid size
     if voxel_size is None:
@@ -125,11 +138,16 @@ def mesh_to_flexible_dual_grid(
     vertices = vertices - aabb[0].reshape(1, 3)
     grid_range = torch.stack([torch.zeros_like(grid_size), grid_size], dim=0).int()
     
+    if backend == 'cuda':
+        from .dual_grid_cuda import mesh_to_dual_grid_cuda
+        return mesh_to_dual_grid_cuda(vertices, faces, voxel_size, grid_size,
+                                      face_weight, boundary_weight, regularization_weight, timing)
+
     ret = _C.mesh_to_flexible_dual_grid_cpu(
-        vertices,
-        faces,
-        voxel_size,
-        grid_range,
+        vertices.contiguous(),
+        faces.contiguous(),
+        voxel_size.contiguous(),
+        grid_range.contiguous(),
         face_weight,
         boundary_weight,
         regularization_weight,

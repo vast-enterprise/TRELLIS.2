@@ -134,3 +134,25 @@ if __name__ == '__main__':
     test_local_conversion_and_upload_cleanup_preserve_input()
     test_local_parser_rejects_invalid_requests()
     print('Local geometry/PBR tests passed')
+
+
+def test_geometry_only_skips_pbr_and_keeps_original_input(tmp_path):
+    glb=tmp_path/'input.glb'
+    glb.write_bytes(b'input')
+    coord=torch.tensor([[1,2,3]],dtype=torch.int32)
+    attr={'vertices':torch.tensor([[1,2,3]],dtype=torch.uint8),
+          'intersected':torch.tensor([[7]],dtype=torch.uint8)}
+    def dump(blender,source,destination,**kwargs):
+        assert kwargs=={'geometry_only':True}
+        fake_dump(blender,source,destination)
+    with mock.patch.object(pipeline,'run_blender_dump',side_effect=dump), \
+         mock.patch.object(pipeline,'convert_geometry',return_value=(coord,attr)) as convert, \
+         mock.patch.object(pipeline,'_convert_pbr_attributes',side_effect=AssertionError('PBR called')), \
+         mock.patch.object(pipeline,'_write_geometry',side_effect=lambda path,*_:path.write_bytes(b'geo')):
+        assert create_geo_pbr_local.main(['asset','--glb',str(glb),'--output-dir',str(tmp_path),
+                                         '--geometry-only','--geometry-loader','blender',
+                                         '--geometry-backend','cpu'])==0
+        assert convert.call_args.kwargs['backend']=='cpu'
+    assert glb.read_bytes()==b'input'
+    assert (tmp_path/'asset.geometry.vxz').read_bytes()==b'geo'
+    assert not (tmp_path/'asset.vxz').exists()

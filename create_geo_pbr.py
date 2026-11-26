@@ -32,6 +32,12 @@ around Blender's +Z, rotating mesh vertices and normals together. Arbitrary
 XYZ angles are available through ``--rotation-degrees``. The local GLB entry
 ``create_geo_pbr_local.py`` shares this pipeline and needs BOS credentials only
 for upload. ``--pkl-only`` saves the transformed dump without voxelization.
+``--geometry-only`` skips material/normal/UV export and writes only geometry.
+It reads static GLB geometry directly by default, without a Blender subprocess
+or intermediate pickle. ``--geometry-loader blender`` forces the legacy loader;
+``glb`` requires direct loading and fails on unsupported features.
+``--geometry-backend auto`` uses CUDA when available; ``cpu`` preserves the
+original float32 dual-vertex solver for legacy cache reproduction.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ import os
 import pickle
 import posixpath
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
@@ -60,6 +67,21 @@ run_blender_dump = _pbr.run_blender_dump
 _load_dump = _pbr._load_dump
 upload_file = _pbr.upload_file
 write_color_ply = _pbr.write_color_ply
+
+
+def _load_geometry_input(glb_path: Path, dump_path: Path, *, loader: str,
+                         blender: str) -> Dict[str, Any]:
+    """Load geometry directly when possible, with an explicit feature fallback."""
+    if loader != 'blender':
+        from glb_geometry import load_glb_geometry, UnsupportedGeometryFeature
+        try:
+            return load_glb_geometry(glb_path)
+        except UnsupportedGeometryFeature as error:
+            if loader == 'glb':
+                raise
+            print(f'Direct GLB geometry unsupported ({error}); using Blender', flush=True)
+    run_blender_dump(blender, glb_path, dump_path, geometry_only=True)
+    return _load_dump(dump_path)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -270,12 +292,20 @@ def convert_geometry(
     boundary_weight: float = 0.2,
     regularization_weight: float = 1e-2,
     timing: bool = False,
+    backend: str = "auto",
 ) -> Tuple["torch.Tensor", Dict[str, "torch.Tensor"]]:
-    """Voxelize a dump into the repository's flexible dual-grid VXZ schema."""
+    """Voxelize a dump into the repository's flexible dual-grid VXZ schema.
+
+    ``auto`` uses CUDA when available. CUDA keeps scan topology but accumulates
+    and solves QEFs in float64; select ``cpu`` for legacy float32 cache values.
+    """
     import o_voxel
     import torch
 
+    started = time.perf_counter()
     vertices, faces = _mesh_from_dump(dump)
+    if timing:
+        print(f"Geometry mesh preparation: {time.perf_counter() - started:.6f}s", flush=True)
     grid = _grid_size(resolution)
     voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
         vertices=vertices,
@@ -286,6 +316,7 @@ def convert_geometry(
         boundary_weight=float(boundary_weight),
         regularization_weight=float(regularization_weight),
         timing=bool(timing),
+        backend=backend,
     )
     if voxel_indices.ndim != 2 or voxel_indices.shape[1] != 3:
         raise RuntimeError(f"dual-grid converter returned invalid coordinates {voxel_indices.shape}")
@@ -312,10 +343,42 @@ def convert_geometry(
     dual_vertices = torch.clamp(dual_vertices * 255, 0, 255).to(torch.uint8)
     flags = intersected[:, :3].to(torch.uint8)
     flags = (flags[:, 0:1] + 2 * flags[:, 1:2] + 4 * flags[:, 2:3]).to(torch.uint8)
-    return voxel_indices.to(torch.int32).cpu(), {
+    result = voxel_indices.to(torch.int32).cpu(), {
         "vertices": dual_vertices.cpu(),
         "intersected": flags.cpu(),
     }
+    if timing:
+        print(f"Geometry conversion including preparation/quantization/readback: {time.perf_counter() - started:.6f}s", flush=True)
+    return result
+
+
+def _intersection_masks_cuda(pbr_coord, geometry_coord, device):
+    """Return exact GPU membership masks, or None for int64 key overflow."""
+    import torch
+
+    pbr = pbr_coord.to(device=device, dtype=torch.int64)
+    geo = geometry_coord.to(device=device, dtype=torch.int64)
+    lower = torch.minimum(pbr.amin(0), geo.amin(0))
+    upper = torch.maximum(pbr.amax(0), geo.amax(0))
+    # Compute extents in Python integers so extreme signed coordinates cannot
+    # overflow before the range check itself.
+    extents = [hi - lo + 1 for hi, lo in zip(upper.tolist(), lower.tolist())]
+    import math
+    if math.prod(extents) >= 2**63:
+        return None
+    def encode(xyz):
+        shifted = xyz - lower
+        return (shifted[:, 0] * extents[1] + shifted[:, 1]) * extents[2] + shifted[:, 2]
+    pbr_keys = encode(pbr)
+    geometry_keys = encode(geo)
+    sorted_keys, order = torch.sort(geometry_keys)
+    if torch.any(sorted_keys[1:] == sorted_keys[:-1]):
+        raise ValueError("geometry coordinates must be unique")
+    positions = torch.searchsorted(sorted_keys, pbr_keys)
+    mask = (positions < len(sorted_keys)) & (sorted_keys[positions.clamp(max=len(sorted_keys)-1)] == pbr_keys)
+    geo_mask = torch.zeros(len(geo), dtype=torch.bool, device=device)
+    geo_mask[order[positions[mask]]] = True
+    return mask, geo_mask
 
 
 def intersect_voxels(
@@ -356,6 +419,32 @@ def intersect_voxels(
     # one uint64.  Joint minima and extents make the mapping valid even for
     # signed coordinates, although production voxel coordinates are
     # non-negative.
+    # Large joins use an exact int64 key on CUDA; only six extrema scalars
+    # cross to the host to check overflow. Preserve arbitrary signed CPU
+    # coordinate support by using the uint64 reference below when needed.
+    gpu_join = (torch.cuda.is_available() and len(pbr_coord) and len(geometry_coord)
+                and os.getenv("TRELLIS_DISABLE_GPU_INTERSECTION", "0") != "1"
+                and (pbr_coord.is_cuda or geometry_coord.is_cuda or
+                     max(len(pbr_coord), len(geometry_coord)) >= 1_000_000))
+    if gpu_join:
+        device = (pbr_coord.device if pbr_coord.is_cuda else geometry_coord.device
+                  if geometry_coord.is_cuda else torch.device('cuda'))
+        try:
+            masks = _intersection_masks_cuda(pbr_coord, geometry_coord, device)
+        except torch.cuda.OutOfMemoryError:
+            # This helper has unwound, so its temporary tensors are freed.
+            masks = None
+        if masks is not None:
+            pbr_mask, geometry_mask = masks
+            common_count = int(geometry_mask.sum().item())
+            def apply_cuda_mask(coord, attrs, mask):
+                return coord[mask.to(coord.device)], {
+                    key: value[mask.to(value.device)] for key, value in attrs.items()
+                }
+            pbr_coord, pbr_attr = apply_cuda_mask(pbr_coord, pbr_attr, pbr_mask)
+            geometry_coord, geometry_attr = apply_cuda_mask(geometry_coord, geometry_attr, geometry_mask)
+            return pbr_coord, pbr_attr, geometry_coord, geometry_attr, common_count
+
     pbr_xyz = pbr_coord.detach().cpu().numpy().astype(np.int64, copy=False)
     geometry_xyz = geometry_coord.detach().cpu().numpy().astype(np.int64, copy=False)
     if len(pbr_xyz) == 0 or len(geometry_xyz) == 0:
@@ -565,6 +654,11 @@ def build_parser(*, local: bool = False) -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None, help="Local PBR output path")
     parser.add_argument("--geometry-output", type=Path, default=None, help="Local dual-grid VXZ path")
     parser.add_argument("--blender", default="blender")
+    parser.add_argument("--geometry-backend", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--geometry-loader", choices=("auto", "glb", "blender"), default="auto",
+                        help="Geometry-only input: auto reads static GLB directly, with Blender fallback")
+    parser.add_argument("--geometry-only", action="store_true",
+                        help="Write only geometry; skip welding, normals, UVs and materials")
     parser.add_argument('--rotation-degrees', '--rotation', dest='rotation_degrees',
                         nargs=3, type=float, metavar=('X', 'Y', 'Z'), default=(0.0, 0.0, 0.0),
                         help='Rotate vertices and normals in XYZ order before both voxelizers (degrees)')
@@ -639,6 +733,10 @@ def build_parser(*, local: bool = False) -> argparse.ArgumentParser:
 
 def _parse_args(parser: argparse.ArgumentParser, argv: Optional[list[str]]) -> argparse.Namespace:
     args = parser.parse_args(argv)
+    if not args.geometry_only and args.geometry_loader != 'auto':
+        parser.error('--geometry-loader requires --geometry-only')
+    if args.geometry_only and (args.upload or args.visualize or args.store_mesh):
+        parser.error("--geometry-only cannot be combined with --upload, --visualize or --store-mesh")
     if args.pkl_only and (args.upload or args.visualize or args.store_mesh):
         parser.error('--pkl-only cannot be combined with --upload, --visualize or --store-mesh')
     if args.store_mesh and (args.output_format != 'vxzm' or args.visualize):
@@ -701,7 +799,9 @@ def _parse_args(parser: argparse.ArgumentParser, argv: Optional[list[str]]) -> a
         parser.error("--geometry-output must use the .vxz suffix")
     if not args.pkl_only and args.output_path == args.geometry_output_path:
         parser.error("PBR and geometry output paths must be different")
-    output_paths = (args.output_path,) if args.pkl_only else (args.output_path, args.geometry_output_path)
+    output_paths = ((args.output_path,) if args.pkl_only else
+                    (args.geometry_output_path,) if args.geometry_only else
+                    (args.output_path, args.geometry_output_path))
     dump_path = args.cache_dir / f'{args.uuid}.pbr.pkl'
     error_path = dump_path.with_name(dump_path.name + '_error.txt')
     if args.glb is not None and args.glb in (*output_paths, dump_path, error_path):
@@ -730,19 +830,34 @@ def main(argv: Optional[list[str]] = None, *, local: bool = False) -> int:
                 client, args.bos_bucket, args.bos_folder, args.uuid, glb_path,
                 args.bos_uri,
             )
-        run_blender_dump(args.blender, glb_path, dump_path)
-        dump = _load_dump(dump_path)
+        dump_started = time.perf_counter()
+        if args.geometry_only:
+            dump = _load_geometry_input(glb_path, dump_path, loader=args.geometry_loader,
+                                        blender=args.blender)
+        else:
+            run_blender_dump(args.blender, glb_path, dump_path)
+            dump = _load_dump(dump_path)
+        if args.timing:
+            label = 'Direct GLB geometry' if dump.get('geometry_loader') == 'glb' else 'Blender dump + pickle read'
+            print(f"{label}: {time.perf_counter() - dump_started:.6f}s", flush=True)
         if any(value != 0.0 for value in args.rotation_degrees):
             rotate_dump_geometry(dump, args.rotation_degrees)
-            with dump_path.open('wb') as stream:
-                pickle.dump(dump, stream)
+            if dump.get('geometry_loader') != 'glb':
+                with dump_path.open('wb') as stream:
+                    pickle.dump(dump, stream)
         if args.pkl_only:
             with args.output_path.open('wb') as stream:
                 pickle.dump(dump, stream)
-            print(f'Wrote PBR dump {args.output_path}')
+            print(f'Wrote {"geometry" if args.geometry_only else "PBR"} dump {args.output_path}')
+            return 0
+        if args.geometry_only:
+            geo_coord, geo_attr = convert_geometry(dump, args.geometry_resolution, timing=args.timing,
+                                                   backend=args.geometry_backend)
+            _write_geometry(args.geometry_output_path, geo_coord, geo_attr, args)
+            print(f"Wrote geometry {args.geometry_output_path} ({len(geo_coord)} voxels)")
             return 0
         pbr_coord, pbr_attr = _convert_pbr_attributes(dump, args)
-        geo_coord, geo_attr = convert_geometry(dump, args.geometry_resolution, timing=args.timing)
+        geo_coord, geo_attr = convert_geometry(dump, args.geometry_resolution, timing=args.timing, backend=args.geometry_backend)
         pbr_coord, pbr_attr, geo_coord, geo_attr, common = intersect_voxels(
             pbr_coord, pbr_attr, geo_coord, geo_attr
         )

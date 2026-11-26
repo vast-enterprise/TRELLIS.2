@@ -13,6 +13,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hashmap_insert_3d_cuda", &hashmap_insert_3d_cuda);
     m.def("hashmap_lookup_3d_cuda", &hashmap_lookup_3d_cuda);
     m.def("hashmap_insert_3d_idx_as_val_cuda", &hashmap_insert_3d_idx_as_val_cuda);
+    m.def("dual_grid_accumulate_cuda", &dual_grid_accumulate_cuda, py::call_guard<py::gil_scoped_release>());
+    m.def("dual_grid_solve_cuda", &dual_grid_solve_cuda, py::call_guard<py::gil_scoped_release>());
     // Convert functions
     m.def("mesh_to_flexible_dual_grid_cpu", &mesh_to_flexible_dual_grid_cpu, py::call_guard<py::gil_scoped_release>());
     m.def("textured_mesh_to_volumetric_attr_cpu", &textured_mesh_to_volumetric_attr_cpu, py::call_guard<py::gil_scoped_release>());
