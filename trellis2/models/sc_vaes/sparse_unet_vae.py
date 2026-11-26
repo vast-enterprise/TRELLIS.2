@@ -6,6 +6,28 @@ import torch.utils.checkpoint
 from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
+from ...modules.sparse.inference_chunk import pointwise, inference_chunks, active_policy
+
+
+def _norm_act(norm, feats):
+    return pointwise(lambda f: F.silu(norm(f)), feats)
+
+
+def _residual(h, x, skip):
+    policy = active_policy()
+    if policy is None:
+        return h + skip(x)
+    rows = policy.rows(h.feats, max(h.feats.shape[-1], x.feats.shape[-1]))
+    if policy.threshold_bytes is not None and len(h.feats) <= rows:
+        return h + skip(x)
+    for start in range(0, len(h.feats), rows):
+        end = start + rows
+        # All supported skip connections are per-row identity/linear/channel
+        # expansion. No convolution or spatial cache is consumed here.
+        value = skip(sp.VarLenTensor(x.feats[start:end])).feats
+        h.feats[start:end].add_(value)
+        policy.record('residual', len(value))
+    return h
 
 
 class SparseResBlock3d(nn.Module):
@@ -67,18 +89,16 @@ class SparseResBlock3d(nn.Module):
         subdiv = None
         if self.upsample:
             subdiv = self.to_subdiv(x)
-        h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = x.replace(_norm_act(self.norm1, x.feats))
         if self.resample_mode == 'spatial2channel':
             h = self.conv1(h)
         h = self._updown(h, subdiv)
         x = self._updown(x, subdiv)
         if self.resample_mode == 'nearest':
             h = self.conv1(h)
-        h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_norm_act(self.norm2, h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual(h, x, self.skip_connection)
         if self.upsample:
             return h, subdiv
         return h
@@ -110,15 +130,13 @@ class SparseResBlockDownsample3d(nn.Module):
         self.updown = sp.SparseDownsample(2)
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
-        h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = x.replace(_norm_act(self.norm1, x.feats))
         h = self.updown(h)
         x = self.updown(x)
         h = self.conv1(h)
-        h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_norm_act(self.norm2, h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual(h, x, self.skip_connection)
         return h
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -154,16 +172,14 @@ class SparseResBlockUpsample3d(nn.Module):
     def _forward(self, x: sp.SparseTensor, subdiv: sp.SparseTensor = None) -> sp.SparseTensor:
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
-        h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = x.replace(_norm_act(self.norm1, x.feats))
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
         h = self.conv1(h)
-        h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_norm_act(self.norm2, h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual(h, x, self.skip_connection)
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -196,15 +212,13 @@ class SparseResBlockS2C3d(nn.Module):
         self.updown = sp.SparseSpatial2Channel(2)
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
-        h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = x.replace(_norm_act(self.norm1, x.feats))
         h = self.conv1(h)
         h = self.updown(h)
         x = self.updown(x)
-        h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_norm_act(self.norm2, h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual(h, x, self.skip_connection)
         return h
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -240,16 +254,14 @@ class SparseResBlockC2S3d(nn.Module):
     def _forward(self, x: sp.SparseTensor, subdiv: sp.SparseTensor = None) -> sp.SparseTensor:
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
-        h = x.replace(self.norm1(x.feats))
-        h = h.replace(F.silu(h.feats))
+        h = x.replace(_norm_act(self.norm1, x.feats))
         h = self.conv1(h)
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
-        h = h.replace(self.norm2(h.feats))
-        h = h.replace(F.silu(h.feats))
+        h = h.replace(_norm_act(self.norm2, h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = _residual(h, x, self.skip_connection)
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -283,9 +295,9 @@ class SparseConvNeXtBlock3d(nn.Module):
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
-        h = h.replace(self.norm(h.feats))
-        h = h.replace(self.mlp(h.feats))
-        return h + x
+        h = h.replace(pointwise(lambda f: self.mlp(self.norm(f)), h.feats,
+                                channels=self.mlp[0].out_features))
+        return _residual(h, x, nn.Identity())
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         if self.use_checkpoint:
@@ -475,7 +487,33 @@ class SparseUnetVaeDecoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-    def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
+    def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None,
+                return_subs: bool = False, *, chunk_size: Union[int, Literal['auto'], None] = None,
+                chunk_memory_mb: Optional[float] = None,
+                chunk_threshold_mb: float = 6144) -> sp.SparseTensor:
+        """Decode with optional convolution halos and bounded workspaces.
+
+        ``chunk_size='auto'`` counts actual voxels at every layer and skips
+        chunking when its estimated peak is below ``chunk_threshold_mb`` (MiB).
+        An integer instead caps rows, including halos, regardless of threshold.
+        Both modes require eval() and no_grad()/inference_mode(). Full tensors
+        remain resident; the estimate is a heuristic, not an OOM guarantee.
+        """
+        self.last_chunk_stats = {}
+        if chunk_size is not None:
+            if self.training:
+                raise RuntimeError('Chunked decode requires model.eval()')
+            automatic = chunk_size == 'auto'
+            with inference_chunks(1_000_000 if automatic else chunk_size, chunk_memory_mb,
+                                  threshold_mb=chunk_threshold_mb if automatic else None) as policy:
+                result = self._decode(x, guide_subs, return_subs)
+            self.last_chunk_stats = dict(policy.stats)
+            return result
+        if chunk_memory_mb is not None:
+            raise ValueError('chunk_memory_mb requires chunk_size')
+        return self._decode(x, guide_subs, return_subs)
+
+    def _decode(self, x, guide_subs=None, return_subs=False):
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
         
@@ -496,7 +534,7 @@ class SparseUnetVaeDecoder(nn.Module):
                 else:
                     h = block(h)
         h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+        h = h.replace(pointwise(lambda f: F.layer_norm(f, f.shape[-1:]), h.feats))
         h = self.output_layer(h)
         if self.training and self.pred_subdiv:
             return h, subs_gt, subs
@@ -519,4 +557,3 @@ class SparseUnetVaeDecoder(nn.Module):
                     h, sub = block(h)
                 else:
                     h = block(h)
-       

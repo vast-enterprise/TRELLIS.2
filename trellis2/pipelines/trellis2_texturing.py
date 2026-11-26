@@ -267,6 +267,8 @@ class Trellis2TexturingPipeline(Pipeline):
     def decode_tex_slat(
         self,
         slat: SparseTensor,
+        *, chunk_size: Union[int, Literal['auto'], None] = None, chunk_memory_mb: Optional[float] = None,
+        chunk_threshold_mb: float = 6144,
     ) -> SparseTensor:
         """
         Decode the structured latent.
@@ -279,7 +281,9 @@ class Trellis2TexturingPipeline(Pipeline):
         """
         if self.low_vram:
             self.models['tex_slat_decoder'].to(self.device)
-        ret = self.models['tex_slat_decoder'](slat) * 0.5 + 0.5
+        ret = self.models['tex_slat_decoder'](slat,
+            **(dict(chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
+                    chunk_threshold_mb=chunk_threshold_mb) if chunk_size is not None else {})) * 0.5 + 0.5
         if self.low_vram:
             self.models['tex_slat_decoder'].cpu()
         return ret
@@ -381,6 +385,9 @@ class Trellis2TexturingPipeline(Pipeline):
         preprocess_image: bool = True,
         resolution: int = 1024,
         texture_size: int = 2048,
+        decode_chunk_size: Union[int, Literal['auto'], None] = None,
+        decode_chunk_memory_mb: Optional[float] = None,
+        decode_chunk_threshold_mb: float = 6144,
     ) -> trimesh.Trimesh:
         """
         Run the pipeline.
@@ -403,6 +410,10 @@ class Trellis2TexturingPipeline(Pipeline):
             cond, tex_model,
             shape_slat, tex_slat_sampler_params
         )
-        pbr_voxel = self.decode_tex_slat(tex_slat)
+        options = (dict(chunk_size=decode_chunk_size,
+                        chunk_memory_mb=decode_chunk_memory_mb,
+                        chunk_threshold_mb=decode_chunk_threshold_mb)
+                   if decode_chunk_size is not None else {})
+        pbr_voxel = self.decode_tex_slat(tex_slat, **options)
         out_mesh = self.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)
         return out_mesh

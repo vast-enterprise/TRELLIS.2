@@ -12,4 +12,6 @@ class SparseLinear(nn.Linear):
         super(SparseLinear, self).__init__(in_features, out_features, bias)
 
     def forward(self, input: VarLenTensor) -> VarLenTensor:
-        return input.replace(super().forward(input.feats))
+        from .inference_chunk import pointwise
+        return input.replace(pointwise(super().forward, input.feats,
+                                       channels=max(self.in_features, self.out_features)))

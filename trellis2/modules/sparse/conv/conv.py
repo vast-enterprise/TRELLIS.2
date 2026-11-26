@@ -16,7 +16,8 @@ class SparseConv3d(nn.Module):
         _backends[config.CONV].sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride, dilation, padding, bias, indice_key)
 
     def forward(self, x: SparseTensor) -> SparseTensor:
-        return _backends[config.CONV].sparse_conv3d_forward(self, x)
+        from ..inference_chunk import convolution
+        return convolution(self, x, _backends[config.CONV].sparse_conv3d_forward)
 
 
 class SparseInverseConv3d(nn.Module):
