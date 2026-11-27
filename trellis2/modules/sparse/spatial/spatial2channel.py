@@ -39,6 +39,10 @@ class SparseSpatial2Channel(nn.Module):
         new_feats = torch.zeros(new_coords.shape[0] * self.factor ** DIM, x.feats.shape[1], device=x.feats.device, dtype=x.feats.dtype)
         from ..inference_chunk import active_policy
         policy = active_policy()
+        if (cache is None and policy is not None and policy.memory_efficient
+                and len(new_coords) * self.factor ** DIM < 2**31):
+            idx = idx.int()
+            subidx = subidx.to(torch.uint8 if self.factor ** DIM <= 256 else torch.int32)
         if policy is not None:
             if torch.is_grad_enabled():
                 raise RuntimeError('Chunked spatial rearrangement cannot run with gradients enabled')
@@ -72,6 +76,32 @@ class SparseSpatial2Channel(nn.Module):
                 
         return out
 
+    def reduced(self, x: SparseTensor, out_channels: int) -> SparseTensor:
+        """S2C followed by the residual channel mean without padded features.
+
+        Each mean group must fit within one child's channels. Missing children
+        remain zero; no scatter reduction or change of addition order is used.
+        The main branch must have already populated the global mapping.
+        """
+        from ..inference_chunk import active_policy
+        slots = self.factor ** (x.coords.shape[-1] - 1)
+        channels = x.feats.shape[1]
+        if out_channels < slots or out_channels % slots or channels % (out_channels // slots):
+            raise ValueError('Reduced S2C requires whole channel groups per child')
+        coords, idx, subidx = x.get_spatial_cache(f'spatial2channel_{self.factor}')
+        child_channels = out_channels // slots
+        output = x.feats.new_zeros((len(coords) * slots, child_channels))
+        policy = active_policy()
+        rows = policy.rows(x.feats, channels)
+        for start in range(0, len(x.feats), rows):
+            end = start + rows
+            value = x.feats[start:end].reshape(-1, child_channels, channels // child_channels).mean(-1)
+            output[idx[start:end] * slots + subidx[start:end]] = value
+            policy.record('reduced_spatial2channel', len(value))
+        out = x.replace(output.view(len(coords), out_channels), coords)
+        out._scale = tuple(s * self.factor for s in x._scale)
+        return out
+
 
 class SparseChannel2Spatial(nn.Module):
     """
@@ -81,6 +111,29 @@ class SparseChannel2Spatial(nn.Module):
     def __init__(self, factor: int = 2):
         super(SparseChannel2Spatial, self).__init__()
         self.factor = factor
+
+    def indices(self, x, subdivision):
+        cache = x.get_spatial_cache(f'channel2spatial_{self.factor}')
+        if cache is not None:
+            return cache
+        if subdivision is None:
+            raise ValueError('Upsampling requires subdivision or an encoder cache')
+        from ..inference_chunk import active_policy
+        idx, subidx = torch.nonzero(subdivision.feats, as_tuple=True)
+        slots = self.factor ** (x.coords.shape[-1] - 1)
+        if len(x.coords) * slots < 2**31:
+            idx = idx.int()
+            subidx = subidx.to(torch.uint8 if slots <= 256 else torch.int32)
+        coords = x.coords.new_empty((len(idx), x.coords.shape[-1]))
+        rows = active_policy().max_points
+        for start in range(0, len(idx), rows):
+            end = start + rows
+            value = x.coords[idx[start:end]].clone()
+            value[:, 1:] *= self.factor
+            for axis in range(x.coords.shape[-1] - 1):
+                value[:, axis + 1] += subidx[start:end] // self.factor**axis % self.factor
+            coords[start:end] = value
+        return coords, idx, subidx
 
     def forward(self, x: SparseTensor, subdivision: Optional[SparseTensor] = None) -> SparseTensor:
         DIM = x.coords.shape[-1] - 1

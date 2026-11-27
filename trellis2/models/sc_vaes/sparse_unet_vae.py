@@ -217,6 +217,12 @@ class SparseResBlockS2C3d(nn.Module):
         h = x.replace(_norm_act(self.norm1, x.feats))
         h = self.conv1(h)
         h = self.updown(h)
+        policy = active_policy()
+        if policy is not None and policy.memory_efficient:
+            skip = self.updown.reduced(x, self.out_channels)
+            h = h.replace(pointwise(lambda f: F.silu(self.norm2(f)), h.feats, inplace=True))
+            h = self.conv2(h)
+            return _residual(h, skip, nn.Identity())
         x = self.updown(x)
         h = h.replace(_norm_act(self.norm2, h.feats))
         h = self.conv2(h)
@@ -257,6 +263,19 @@ class SparseResBlockC2S3d(nn.Module):
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
         h = x.replace(_norm_act(self.norm1, x.feats))
+        policy = active_policy()
+        if policy is not None and policy.memory_efficient:
+            from ...modules.sparse.inference_chunk import convolution_to_children
+            mask = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
+            h = convolution_to_children(self.conv1, h, self.updown, mask)
+            skip = self.updown(x, mask)
+            # Both branches use the same subdivision/order. Keep one global
+            # coordinate buffer instead of two high-resolution copies.
+            skip.coords = h.coords
+            h = h.replace(pointwise(lambda f: F.silu(self.norm2(f)), h.feats, inplace=True))
+            h = self.conv2(h)
+            h = _residual(h, skip, self.skip_connection)
+            return (h, subdiv) if self.pred_subdiv else h
         h = self.conv1(h)
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
@@ -299,17 +318,20 @@ class SparseConvNeXtBlock3d(nn.Module):
         h = self.conv(x)
         policy = active_policy()
         if policy is not None and policy.preserve_linear_shapes:
-            # Retain the original FP16 GEMM row count as well as the FP32
-            # input projection. Shape-dependent cuBLAS accumulation choices
-            # otherwise propagate small errors through the deep encoder.
-            value = pointwise(self.norm, h.feats)
+            # Keep GEMM shapes: changing row counts can change FP16/TF32 rounding.
+            efficient = policy.memory_efficient
+            value = pointwise(self.norm, h.feats, inplace=efficient)
+            if efficient:
+                meta = h.replace(h.feats.new_empty((len(h.feats), 0)))
+                del h
             value = self.mlp[0](value)
-            value = pointwise(self.mlp[1], value)
-            h = h.replace(self.mlp[2](value))
+            value = pointwise(self.mlp[1], value, inplace=efficient)
+            h = (meta if efficient else h).replace(self.mlp[2](value))
             del value
         else:
             h = h.replace(pointwise(lambda f: self.mlp(self.norm(f)), h.feats,
-                                    channels=self.mlp[0].out_features))
+                                    channels=self.mlp[0].out_features,
+                                    inplace=bool(policy and policy.memory_efficient)))
         return _residual(h, x, nn.Identity())
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -399,7 +421,7 @@ class SparseUnetVaeEncoder(nn.Module):
                 chunk_size: Union[int, Literal['auto'], None] = None,
                 chunk_memory_mb: Optional[float] = None,
                 chunk_threshold_mb: float = 6144,
-                max_memory_gb: Optional[float] = None):
+                max_memory_gb: Optional[float] = None, allow_host_offload: bool = False):
         """Encode with optional inference-time adaptive chunking.
 
         Chunking is applied to pointwise layers, stride-one convolutions and
@@ -413,8 +435,11 @@ class SparseUnetVaeEncoder(nn.Module):
         at different chunk sizes; bitwise equality is not guaranteed.
         ``max_memory_gb=23`` enables a 23 GiB deployment budget, reserving
         at least 1.5 GiB (or observed external CUDA usage plus 256 MiB).
-        Large intermediate features spill losslessly to CPU when needed. External
-        CUDA allocations can still grow; the cap enforces PyTorch allocations.
+        This path reuses GPU intermediates and fuses resampling writes. CPU
+        staging is disabled unless ``allow_host_offload=True``. Set
+        ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` before CUDA startup
+        to reduce fragmentation. External CUDA allocations can still grow;
+        the cap enforces PyTorch allocations, not other processes.
         """
         self.last_chunk_stats = {}
         if max_memory_gb is not None:
@@ -422,6 +447,7 @@ class SparseUnetVaeEncoder(nn.Module):
             return bounded_vae(self, x, max_memory_gb, 'encode',
                                chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
                                chunk_threshold_mb=chunk_threshold_mb,
+                               allow_host_offload=allow_host_offload,
                                sample_posterior=sample_posterior, return_raw=return_raw)
         if chunk_size is not None:
             if self.training:
@@ -440,11 +466,20 @@ class SparseUnetVaeEncoder(nn.Module):
     def _encode(self, x, sample_posterior=False, return_raw=False):
         h = self.input_layer(x)
         h = h.type(self.dtype)
+        pending = [h]
+        del h
+        return self._encode_features(pending, x.dtype, sample_posterior, return_raw)
+
+    def _encode_features(self, pending, input_dtype, sample_posterior=False, return_raw=False):
+        # Transfer ownership so the caller does not retain the first feature
+        # grid (potentially many GiB) through all subsequent encoder blocks.
+        h = pending.pop()
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 h = block(h)
-        h = h.type(x.dtype)
-        h = h.replace(pointwise(lambda f: F.layer_norm(f, f.shape[-1:]), h.feats))
+        h = h.type(input_dtype)
+        h = h.replace(pointwise(lambda f: F.layer_norm(f, f.shape[-1:]), h.feats,
+                               inplace=bool(active_policy() and active_policy().memory_efficient)))
         h = self.to_latent(h)
         
         # Sample from the posterior distribution
@@ -546,7 +581,7 @@ class SparseUnetVaeDecoder(nn.Module):
                 return_subs: bool = False, *, chunk_size: Union[int, Literal['auto'], None] = None,
                 chunk_memory_mb: Optional[float] = None,
                 chunk_threshold_mb: float = 6144,
-                max_memory_gb: Optional[float] = None) -> sp.SparseTensor:
+                max_memory_gb: Optional[float] = None, allow_host_offload: bool = False) -> sp.SparseTensor:
         """Decode with optional convolution halos and bounded workspaces.
 
         ``chunk_size='auto'`` counts actual voxels at every layer and skips
@@ -555,7 +590,10 @@ class SparseUnetVaeDecoder(nn.Module):
         Both modes require eval() and no_grad()/inference_mode(). Full tensors
         remain resident; the estimate is a heuristic, not an OOM guarantee.
         ``max_memory_gb=23`` caps the allocator after reserving at least
-        1.5 GiB for external CUDA allocations, with host storage as fallback.
+        1.5 GiB for external CUDA allocations. Intermediates stay on GPU;
+        host storage is available only with ``allow_host_offload=True``.
+        Use ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` at startup to
+        reduce allocator fragmentation with large full-shape GEMMs.
         """
         self.last_chunk_stats = {}
         if max_memory_gb is not None:
@@ -563,6 +601,7 @@ class SparseUnetVaeDecoder(nn.Module):
             return bounded_vae(self, x, max_memory_gb, 'decode',
                                chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
                                chunk_threshold_mb=chunk_threshold_mb,
+                               allow_host_offload=allow_host_offload,
                                guide_subs=guide_subs, return_subs=return_subs)
         if chunk_size is not None:
             if self.training:
@@ -597,8 +636,12 @@ class SparseUnetVaeDecoder(nn.Module):
                         h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
                 else:
                     h = block(h)
+        policy = active_policy()
+        if policy is not None and policy.memory_efficient:
+            policy.plans.clear()
         h = h.type(x.dtype)
-        h = h.replace(pointwise(lambda f: F.layer_norm(f, f.shape[-1:]), h.feats))
+        h = h.replace(pointwise(lambda f: F.layer_norm(f, f.shape[-1:]), h.feats,
+                               inplace=bool(active_policy() and active_policy().memory_efficient)))
         h = self.output_layer(h)
         if self.training and self.pred_subdiv:
             return h, subs_gt, subs

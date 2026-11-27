@@ -64,7 +64,10 @@ def test_oom_fallback_and_allocator_restore(monkeypatch):
         def fail(*args, **kwargs):
             raise torch.cuda.OutOfMemoryError('injected GPU workspace exhaustion')
         monkeypatch.setattr(model, '_encode', fail)
-        got = run(model, x, max_memory_gb=23)
+        with pytest.raises(torch.cuda.OutOfMemoryError, match='injected'):
+            run(model, x, max_memory_gb=23)
+        assert torch.cuda.get_per_process_memory_fraction() == fraction
+        got = run(model, x, max_memory_gb=23, allow_host_offload=True)
         torch.testing.assert_close(got.feats, reference.feats, atol=3e-5, rtol=3e-5)
         assert model.last_chunk_stats['host_offload']
         assert model.last_chunk_stats['gpu_oom_fallbacks'] == 1
@@ -82,7 +85,7 @@ def test_oom_fallback_and_allocator_restore(monkeypatch):
         run(model, x, max_memory_gb=23)
 
 
-def test_mesh_chunks_keep_cross_boundary_faces_and_order():
+def test_mesh_chunks_keep_cross_boundary_faces_and_order(monkeypatch):
     from o_voxel.convert import flexible_dual_grid_to_mesh
     torch.manual_seed(91)
     coords = grid(n=7).coords[:, 1:]
@@ -92,6 +95,9 @@ def test_mesh_chunks_keep_cross_boundary_faces_and_order():
     kwargs = dict(aabb=[[-.5]*3, [.5]*3], grid_size=16)
     with torch.inference_mode():
         reference = flexible_dual_grid_to_mesh(coords, vertices, flags, weights, **kwargs)
+        def forbidden(*args, **kwargs):
+            raise AssertionError('Mesh chunks must stay on GPU')
+        monkeypatch.setattr(torch.Tensor, 'cpu', forbidden)
         for rows in (1, 17, 500):
             got = flexible_dual_grid_to_mesh(coords, vertices, flags, weights, chunk_size=rows, **kwargs)
             assert all(torch.equal(a, b) for a, b in zip(reference, got))
@@ -146,3 +152,63 @@ def test_host_decoder_preserves_encoder_upsampling_cache():
         got = executor.decode(z)
         assert torch.equal(got.coords, fine.coords)
         torch.testing.assert_close(got.feats, reference.feats, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.parametrize('context', [torch.no_grad, torch.inference_mode])
+@pytest.mark.parametrize('geometry', [False, True])
+def test_resident_encoder_decoder_without_host_transfers(context, geometry, monkeypatch):
+    import trellis2.modules.sparse.bounded_vae as bounded
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Resident inference must not transfer features to CPU')
+    monkeypatch.setattr(bounded, '_transfer', forbidden)
+    monkeypatch.setattr(bounded, 'HostVae', forbidden)
+    with context():
+        x = inputs()
+        if geometry:
+            # FDG promotes vertices + boolean intersections to FP32 before
+            # projection, even when caller-owned vertex features are FP16.
+            x = x.half()
+        original = x.feats.clone()
+        enc = encoder(geometry)
+        ref = run(enc, x, geometry)
+        got = run(enc, x, geometry, max_memory_gb=23, chunk_size=256)
+        torch.testing.assert_close(got.feats, ref.feats, atol=3e-5, rtol=3e-5)
+        assert torch.equal(x.feats, original)
+        assert not enc.last_chunk_stats['host_offload']
+        assert enc.last_chunk_stats['reduced_spatial2channel_chunks'] > 0
+        shape, texture, z = decoder(), decoder(False), grid(n=5)
+        ref, subs = shape(z, return_subs=True)
+        got, gs = shape(sp.SparseTensor(z.feats, z.coords), return_subs=True,
+                        max_memory_gb=23, chunk_size=256)
+        assert torch.equal(ref.coords, got.coords)
+        torch.testing.assert_close(got.feats, ref.feats, atol=3e-5, rtol=3e-5)
+        for a, b in zip(subs, gs):
+            assert torch.equal(a.coords, b.coords)
+            torch.testing.assert_close(a.feats, b.feats, atol=3e-5, rtol=3e-5)
+        ref = texture(sp.SparseTensor(z.feats, z.coords), guide_subs=subs)
+        got = texture(sp.SparseTensor(z.feats, z.coords), guide_subs=gs,
+                      max_memory_gb=23, chunk_size=256)
+        torch.testing.assert_close(got.feats, ref.feats, atol=3e-5, rtol=3e-5)
+        assert not shape.last_chunk_stats['host_offload']
+        assert not texture.last_chunk_stats['host_offload']
+
+
+def test_resident_resampling_preserves_missing_children_and_cache():
+    from trellis2.modules.sparse.inference_chunk import inference_chunks
+    op = sp.SparseSpatial2Channel(2).cuda().eval()
+    with torch.no_grad():
+        x = inputs()
+        x = x.replace(torch.randn(len(x.feats), 8, device='cuda').half())
+        full = op(x)
+        reference = full.feats.reshape(len(full.feats), 16, 4).mean(-1)
+        with inference_chunks(113, memory_efficient=True):
+            reduced = op.reduced(x, 16)
+        assert torch.equal(reduced.coords, full.coords)
+        assert torch.equal(reduced.feats, reference)
+        fine = grid(n=8, channels=1)
+        z = op(fine)
+        model = decoder(False)
+        ref = model(z)
+        got = model(z, max_memory_gb=23, chunk_size=256)
+        assert torch.equal(got.coords, fine.coords)
+        torch.testing.assert_close(got.feats, ref.feats, atol=3e-5, rtol=3e-5)

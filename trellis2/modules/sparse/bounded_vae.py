@@ -1,8 +1,8 @@
-"""Inference-only VAE execution with host feature storage and a CUDA budget.
+"""GPU-resident inference with a CUDA budget and optional host fallback.
 
-Features are spilled losslessly to CPU between operations. Convolutions compute
-one layer at a time with complete halos; linear projections retain their full
-matrix shapes. This trades PCIe traffic and host RAM for bounded GPU residency.
+The resident path reuses disposable feature storage, fuses resampling writes,
+and releases completed spatial plans. Linear projections keep full GEMM shapes.
+Host feature staging is opt-in because PCIe transfers are expensive.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -369,8 +369,9 @@ class HostVae:
 
 
 def bounded_vae(model, x, max_memory_gb, operation, *, chunk_size='auto',
-                chunk_memory_mb=None, chunk_threshold_mb=6144, **kwargs):
-    """Budgeted VAE entry point; full features live on CPU between CUDA ops."""
+                chunk_memory_mb=None, chunk_threshold_mb=6144, allow_host_offload=False,
+                input_factory=None, **kwargs):
+    """Budgeted GPU inference; CPU staging requires allow_host_offload=True."""
     if model.training:
         raise RuntimeError('Bounded VAE inference requires model.eval()')
     points = 1_000_000 if chunk_size in (None, 'auto') else chunk_size
@@ -382,31 +383,45 @@ def bounded_vae(model, x, max_memory_gb, operation, *, chunk_size='auto',
         raise ValueError('chunk_threshold_mb must be finite and positive')
     threshold = chunk_threshold_mb if chunk_size in (None, 'auto') else None
     with cuda_budget(model.device, max_memory_gb) as limit:
-        # Leave the current GPU path in place for inputs that fit. For large
-        # encoders the expanded first stage already predicts the need to spill.
-        estimate = len(x.feats) * model.model_channels[0] * 4 * 4
+        # Attempt resident execution even for large inputs: counting an
+        # unfused block's temporaries incorrectly predicts the need to spill.
         retry = 0
-        if x.device.type == 'cuda' and (operation == 'decode' or
-                torch.cuda.memory_allocated(model.device) + estimate < limit):
-            fresh = policy = None
+        if x.device.type == 'cuda':
+            fresh = policy = prepared = h = pending = None
             try:
                 fresh = SparseTensor(x.feats, x.coords, scale=x._scale)
                 fresh._spatial_cache = {k: dict(v) for k, v in x._spatial_cache.items()}
-                with inference_chunks(points, chunk_memory_mb, threshold_mb=threshold,
-                                      preserve_linear_shapes=True) as policy:
-                    result = getattr(model, '_' + operation)(fresh, **kwargs)
+                # Use the same workspace estimate on 24/80 GiB devices. A
+                # hardware-free-memory heuristic can change convolution chunk
+                # shapes (and floating-point kernels) on the smaller device.
+                with inference_chunks(points, chunk_memory_mb or 8192, threshold_mb=threshold,
+                                      preserve_linear_shapes=True, memory_efficient=True) as policy:
+                    if input_factory is not None:
+                        prepared = input_factory(fresh)
+                        input_dtype = prepared.dtype
+                        h = model.input_layer(prepared).type(model.dtype)
+                        prepared = None
+                        pending = [h]
+                        h = None
+                        result = model._encode_features(pending, input_dtype, **kwargs)
+                    else:
+                        result = getattr(model, '_' + operation)(fresh, **kwargs)
                 model.last_chunk_stats = dict(policy.stats, host_offload=False,
                     max_memory_gb=max_memory_gb, allocator_limit_gib=limit / 1024**3)
                 return result
             except torch.cuda.OutOfMemoryError:
+                if not allow_host_offload:
+                    raise
                 # Exit the except block before retrying: its traceback holds
                 # references to intermediates from the failed forward.
                 retry = 1
-            del fresh, policy
+            del fresh, policy, prepared, h, pending
             gc.collect()
             torch.cuda.empty_cache()
+        if not allow_host_offload:
+            raise ValueError('GPU-resident bounded inference requires CUDA input')
         executor = HostVae(model, limit, points, chunk_memory_mb, threshold)
-        result = getattr(executor, operation)(x, **kwargs)
+        result = getattr(executor, operation)(input_factory(x) if input_factory else x, **kwargs)
         model.last_chunk_stats = dict(executor.policy.stats, max_memory_gb=max_memory_gb,
                                       gpu_oom_fallbacks=retry)
         return result

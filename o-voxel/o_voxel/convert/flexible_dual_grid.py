@@ -183,7 +183,7 @@ def flexible_dual_grid_to_mesh(
             NOTE: One of voxel_size and grid_size must be provided.
         train (bool): Whether to use training mode.
         chunk_size (int): Optional inference-only core voxel count. Uses the
-            global voxel hash for neighbors and stages faces on CPU. Requires
+            global voxel hash for neighbors and keeps faces on GPU. Requires
             split_weight; preserves vertex/face order and diagonal decisions.
         
     Returns:
@@ -345,9 +345,9 @@ def _chunked_dual_grid_mesh(coords, dual_vertices, intersected_flag, split_weigh
         weights = split_weight[quads]
         triangles = torch.where(weights[:, 0] * weights[:, 2] > weights[:, 1] * weights[:, 3],
                                 quads[:, split1], quads[:, split2]).reshape(-1, 3)
-        faces.append(triangles.cpu())
+        faces.append(triangles)
         del neighbors, keys, indices, quads, weights, triangles
     del hashmap
-    triangles = (torch.cat(faces, dim=0).to(coords.device) if faces else
+    triangles = (torch.cat(faces, dim=0) if faces else
                  torch.empty((0, 3), dtype=torch.int32, device=coords.device))
     return vertices, triangles

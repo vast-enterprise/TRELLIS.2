@@ -48,6 +48,13 @@ class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
         from ...modules.sparse.bounded_vae import cuda_budget
         budget = kwargs.get('max_memory_gb')
         with cuda_budget(self.device, budget) if budget is not None else nullcontext():
+            if budget is not None:
+                from ...modules.sparse.bounded_vae import bounded_vae
+                self.last_chunk_stats = {}
+                def prepare(v):
+                    return v.replace(torch.cat([v.feats - .5, intersected.feats.float() - .5], 1))
+                return bounded_vae(self, vertices, operation='encode', input_factory=prepare,
+                                   sample_posterior=sample_posterior, return_raw=return_raw, **kwargs)
             x = vertices.replace(torch.cat([
                 vertices.feats - 0.5,
                 intersected.feats.float() - 0.5,

@@ -24,6 +24,7 @@ class ChunkPolicy:
     memory_budget_bytes: int | None = None
     threshold_bytes: int | None = None
     preserve_linear_shapes: bool = False
+    memory_efficient: bool = False
     stats: dict = field(default_factory=dict)
     plans: dict = field(default_factory=dict, repr=False)
 
@@ -69,7 +70,7 @@ def active_policy():
 
 @contextmanager
 def inference_chunks(max_points=1_000_000, memory_budget_mb=None, *, threshold_mb=None,
-                     preserve_linear_shapes=False):
+                     preserve_linear_shapes=False, memory_efficient=False):
     """Enable chunked operations inside no_grad/inference_mode; thread-local.
 
     ``max_points`` includes the convolution halo. ``memory_budget_mb`` sets
@@ -77,6 +78,8 @@ def inference_chunks(max_points=1_000_000, memory_budget_mb=None, *, threshold_m
     additional. With None it adapts to free CUDA memory (20%, capped at 8 GiB).
     ``preserve_linear_shapes`` keeps encoder GEMMs at their original row count:
     cuBLAS can change precision/reduction order when the matrix shape changes.
+    ``memory_efficient`` enables VAE-specific buffer reuse and resampling
+    fusion. Caller-owned inputs are never overwritten.
     """
     if torch.is_grad_enabled():
         raise RuntimeError('Chunked inference requires torch.no_grad() or torch.inference_mode()')
@@ -89,11 +92,14 @@ def inference_chunks(max_points=1_000_000, memory_budget_mb=None, *, threshold_m
     policy = ChunkPolicy(max_points,
                          None if memory_budget_mb is None else int(memory_budget_mb * 1024**2),
                          None if threshold_mb is None else int(threshold_mb * 1024**2),
-                         preserve_linear_shapes=preserve_linear_shapes)
+                         preserve_linear_shapes=preserve_linear_shapes,
+                         memory_efficient=memory_efficient)
     if threshold_mb is not None:
         policy.stats.update(auto=True, auto_threshold_mib=threshold_mb)
     if preserve_linear_shapes:
         policy.stats['preserve_linear_shapes'] = True
+    if memory_efficient:
+        policy.stats['memory_efficient'] = True
     token = _ACTIVE.set(policy)
     try:
         yield policy
@@ -101,17 +107,17 @@ def inference_chunks(max_points=1_000_000, memory_budget_mb=None, *, threshold_m
         _ACTIVE.reset(token)
 
 
-def pointwise(fn, feats, *, channels=None):
-    """Run an independent per-row operation without retaining its workspaces."""
+def pointwise(fn, feats, *, channels=None, inplace=False):
+    """Run a rowwise operation; inplace requires a disposable, same-shape buffer."""
     policy = active_policy()
     if policy is None:
         return fn(feats)
     if torch.is_grad_enabled():
         raise RuntimeError('Chunked pointwise operations cannot run with gradients enabled')
     rows = policy.rows(feats, channels or feats.shape[-1])
-    if len(feats) <= rows:
+    if len(feats) <= rows and not inplace:
         return fn(feats)
-    output = None
+    output = feats if inplace else None
     for start in range(0, len(feats), rows):
         value = fn(feats[start:start + rows])
         if output is None:
@@ -159,7 +165,7 @@ def _spatial_plan(coords, limit, radius):
     return plans
 
 
-def convolution(module, x, unchunked):
+def convolution(module, x, unchunked, *, destination=None, write=None):
     """Apply a stride-one odd-kernel submanifold conv with complete halos."""
     from .basic import SparseTensor
     from . import config
@@ -175,26 +181,67 @@ def convolution(module, x, unchunked):
         raise NotImplementedError('Chunking requires stride-one odd-kernel submanifold convolution')
     rows = policy.rows(x.feats, max(module.in_channels, module.out_channels), convolution=True)
     if len(x.feats) <= rows:
-        return unchunked(module, x)
+        result = unchunked(module, x)
+        if write is not None:
+            write(torch.arange(len(x.feats), device=x.device), result.feats)
+            return destination
+        return result
     radius = tuple((k // 2) * d for k, d in zip(module.kernel_size, module.dilation))
     key = (x.coords.data_ptr(), len(x.coords), rows, radius)
     # Plan indices are reused across repeated blocks at one resolution. Never
     # attach per-chunk convolution neighbor maps to the full sparse tensor.
     entry = policy.plans.get(key)
     if entry is None:
+        if policy.memory_efficient:
+            # VAE stages only move in one direction through resolutions.
+            # A finished scale's partition indices are no longer useful.
+            policy.plans.clear()
         plan = _spatial_plan(x.coords, rows, radius)
+        if policy.memory_efficient and len(x.coords) < 2**31:
+            plan = [tuple(t.int() for t in part) for part in plan]
         policy.plans[key] = (x.coords, plan)
     else:
         plan = entry[1]
-    output = x.feats.new_empty((len(x.feats), module.out_channels))
+    output = x.feats.new_empty((len(x.feats), module.out_channels)) if write is None else None
     shape = torch.Size([x.shape[0], x.feats.shape[1]])
     spatial_shape = x.spatial_shape
     for inputs, local, targets in plan:
         part = SparseTensor(x.feats[inputs], x.coords[inputs], shape=shape, scale=x._scale)
         part.register_spatial_cache('shape', spatial_shape)
         result = unchunked(module, part)
-        output[targets] = result.feats[local]
+        if write is None:
+            output[targets] = result.feats[local]
+        else:
+            write(targets, result.feats[local])
         policy.record('convolution', len(inputs))
         policy.stats['halo_rows'] = policy.stats.get('halo_rows', 0) + len(inputs) - len(targets)
         del part, result
-    return x.replace(output)
+    return x.replace(output) if write is None else destination
+
+
+def convolution_to_children(module, x, updown, subdivision):
+    """Write convolution cores directly into their selected child slots."""
+    from .conv.conv_flex_gemm import sparse_conv3d_forward
+    from .basic import SparseTensor
+    coords, idx, subidx = updown.indices(x, subdivision)
+    slots = updown.factor ** (x.coords.shape[-1] - 1)
+    channels = module.out_channels // slots
+    index_dtype = torch.int32 if len(coords) < 2**31 else torch.int64
+    mapping = torch.full((len(x.coords) * slots,), -1, dtype=index_dtype, device=x.device)
+    policy = active_policy()
+    rows = policy.max_points
+    for start in range(0, len(idx), rows):
+        end = min(start + rows, len(idx))
+        mapping[idx[start:end].long() * slots + subidx[start:end]] = torch.arange(
+            start, end, device=x.device, dtype=index_dtype)
+    del idx, subidx
+    mapping = mapping.view(-1, slots)
+    output = x.feats.new_empty((len(coords), channels))
+    def write(targets, values):
+        dest = mapping[targets].flatten()
+        valid = dest >= 0
+        output[dest[valid]] = values.reshape(-1, channels)[valid]
+    out = SparseTensor(output, coords, scale=tuple(s / updown.factor for s in x._scale))
+    if x.get_spatial_cache(f'channel2spatial_{updown.factor}') is not None:
+        out._spatial_cache = x._spatial_cache
+    return convolution(module, x, sparse_conv3d_forward, destination=out, write=write)
