@@ -20,11 +20,13 @@ def _residual(h, x, skip):
     rows = policy.rows(h.feats, max(h.feats.shape[-1], x.feats.shape[-1]))
     if policy.threshold_bytes is not None and len(h.feats) <= rows:
         return h + skip(x)
+    projected = skip(x) if policy.preserve_linear_shapes and isinstance(skip, sp.SparseLinear) else None
     for start in range(0, len(h.feats), rows):
         end = start + rows
         # All supported skip connections are per-row identity/linear/channel
         # expansion. No convolution or spatial cache is consumed here.
-        value = skip(sp.VarLenTensor(x.feats[start:end])).feats
+        value = (projected.feats[start:end] if projected is not None else
+                 skip(sp.VarLenTensor(x.feats[start:end])).feats)
         h.feats[start:end].add_(value)
         policy.record('residual', len(value))
     return h
@@ -295,8 +297,19 @@ class SparseConvNeXtBlock3d(nn.Module):
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
-        h = h.replace(pointwise(lambda f: self.mlp(self.norm(f)), h.feats,
-                                channels=self.mlp[0].out_features))
+        policy = active_policy()
+        if policy is not None and policy.preserve_linear_shapes:
+            # Retain the original FP16 GEMM row count as well as the FP32
+            # input projection. Shape-dependent cuBLAS accumulation choices
+            # otherwise propagate small errors through the deep encoder.
+            value = pointwise(self.norm, h.feats)
+            value = self.mlp[0](value)
+            value = pointwise(self.mlp[1], value)
+            h = h.replace(self.mlp[2](value))
+            del value
+        else:
+            h = h.replace(pointwise(lambda f: self.mlp(self.norm(f)), h.feats,
+                                    channels=self.mlp[0].out_features))
         return _residual(h, x, nn.Identity())
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -382,14 +395,45 @@ class SparseUnetVaeEncoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-    def forward(self, x: sp.SparseTensor, sample_posterior=False, return_raw=False):
+    def forward(self, x: sp.SparseTensor, sample_posterior=False, return_raw=False, *,
+                chunk_size: Union[int, Literal['auto'], None] = None,
+                chunk_memory_mb: Optional[float] = None,
+                chunk_threshold_mb: float = 6144):
+        """Encode with optional inference-time adaptive chunking.
+
+        Chunking is applied to pointwise layers, stride-one convolutions and
+        spatial-to-channel rearrangements. Global parent/child indices and
+        complete per-convolution halos preserve the full-pass receptive field.
+        Linear projections keep their original matrix shapes to avoid cuBLAS
+        precision changes; full feature tensors still reside on the device.
+        Use only with ``eval()`` and ``no_grad()``/``inference_mode()``.
+        Compare deterministic latents with ``sample_posterior=False``; sampling
+        requires the same RNG state. Floating-point kernels can round differently
+        at different chunk sizes; bitwise equality is not guaranteed.
+        """
+        self.last_chunk_stats = {}
+        if chunk_size is not None:
+            if self.training:
+                raise RuntimeError('Chunked encode requires model.eval()')
+            automatic = chunk_size == 'auto'
+            with inference_chunks(1_000_000 if automatic else chunk_size, chunk_memory_mb,
+                                  threshold_mb=chunk_threshold_mb if automatic else None,
+                                  preserve_linear_shapes=True) as policy:
+                result = self._encode(x, sample_posterior, return_raw)
+            self.last_chunk_stats = dict(policy.stats)
+            return result
+        if chunk_memory_mb is not None:
+            raise ValueError('chunk_memory_mb requires chunk_size')
+        return self._encode(x, sample_posterior, return_raw)
+
+    def _encode(self, x, sample_posterior=False, return_raw=False):
         h = self.input_layer(x)
         h = h.type(self.dtype)
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 h = block(h)
         h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+        h = h.replace(pointwise(lambda f: F.layer_norm(f, f.shape[-1:]), h.feats))
         h = self.to_latent(h)
         
         # Sample from the posterior distribution

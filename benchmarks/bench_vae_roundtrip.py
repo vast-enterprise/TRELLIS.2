@@ -119,14 +119,20 @@ def main():
     parser.add_argument('--chunk-memory-mb', type=float)
     parser.add_argument('--chunk-threshold-mb', type=float, default=6144)
     parser.add_argument('--context', choices=['inference', 'no_grad'], default='inference')
+    parser.add_argument('--require-exact', action='store_true',
+                        help='Fail unless encode coordinates, latent and logvar are bitwise equal to full')
     parser.add_argument('--guidance', choices=['input', 'geometry'], default='input')
     parser.add_argument('--resolution', type=int, default=1024)
     parser.add_argument('--repeats', type=int, default=3, help='Warm up once, then time fresh-cache runs')
     args = parser.parse_args()
+    if args.require_exact and (args.phase != 'encode' or args.chunk_size is None):
+        parser.error('--require-exact needs --phase encode and --chunk-size')
+    if args.require_exact and not (args.folder / f'{args.kind}_encode_full.pt').exists():
+        parser.error('Run full encoding first to create the comparison reference')
     torch.set_num_threads(4)
     phase = args.phase
     label = 'auto' if args.chunk_size == 'auto' else ('chunked' if args.chunk_size else 'full')
-    name = args.kind + '_' + phase + ('_' + label if phase == 'decode' else '')
+    name = args.kind + '_' + phase + ('_' + label if phase in ('encode', 'decode') else '')
     if args.kind == 'texture' and phase == 'decode':
         name += '_' + args.guidance
     prefix = 'shape' if args.kind == 'geometry' else 'tex'
@@ -157,7 +163,11 @@ def main():
     def run():
         if phase == 'encode':
             fresh = sp.SparseTensor(x.feats, x.coords)
-            return model(fresh, fresh.replace(flags.feats)) if flags is not None else model(fresh)
+            kwargs = dict(chunk_size=args.chunk_size, chunk_memory_mb=args.chunk_memory_mb,
+                          chunk_threshold_mb=args.chunk_threshold_mb, return_raw=True,
+                          sample_posterior=False)
+            return (model(fresh, fresh.replace(flags.feats), **kwargs) if flags is not None
+                    else model(fresh, **kwargs))
         elif phase == 'decode':
             fresh = sp.SparseTensor(z.feats, z.coords)
             kwargs = dict(chunk_size=args.chunk_size, chunk_memory_mb=args.chunk_memory_mb,
@@ -194,6 +204,7 @@ def main():
             if rep != args.repeats - 1:
                 del value
         if phase == 'mesh': mesh = value
+        elif phase == 'encode': out, mean, logvar = value
         elif phase == 'decode' and args.kind == 'geometry': out, subs = value
         else: out = value
     import statistics
@@ -202,7 +213,8 @@ def main():
               'seconds': seconds, 'baseline_cuda_gib': baseline / 1024**3,
               'peak_cuda_gib': max(peaks), 'seconds_runs': times,
               'peak_reserved_cuda_gib': max(reserved),
-              'chunk_size': args.chunk_size, 'chunk_memory_mb': args.chunk_memory_mb}
+              'chunk_size': args.chunk_size, 'chunk_memory_mb': args.chunk_memory_mb,
+              'chunk_threshold_mb': args.chunk_threshold_mb, 'resolution': args.resolution}
     if phase == 'mesh':
         result.update(vertices=len(mesh[0]), faces=len(mesh[1]), finite=bool(torch.isfinite(mesh[0]).all()))
         torch.save({'vertices': mesh[0].cpu(), 'faces': mesh[1].cpu()}, args.folder / 'decoded_mesh.pt')
@@ -210,8 +222,24 @@ def main():
         result.update(output_rows=len(out.feats), finite=bool(torch.isfinite(out.feats).all()))
         output = pack(out)
         if phase == 'encode':
-            torch.save(output, args.folder / (args.kind + '_latent.pt'))
+            # Keep the unchunked latent as the roundtrip baseline. Chunked
+            # runs get separate artifacts and never overwrite the reference.
+            if args.chunk_size is None:
+                torch.save(output, args.folder / (args.kind + '_latent.pt'))
+            output['logvar'] = logvar.float().cpu()
+            torch.save(output, args.folder / (name + '.pt'))
             result['input_rows'] = len(x.feats)
+            result['chunk_stats'] = getattr(model, 'last_chunk_stats', {})
+            ref_path = args.folder / f'{args.kind}_encode_full.pt'
+            if args.chunk_size is not None and ref_path.exists():
+                reference = torch.load(ref_path, weights_only=True)
+                result['full_vs_chunked'] = compare(reference, output)
+                result['logvar_comparison'] = compare(
+                    dict(coords=reference['coords'], feats=reference['logvar']),
+                    dict(coords=output['coords'], feats=output['logvar']))
+                result['latent_bitwise_equal'] = (torch.equal(reference['coords'], output['coords'])
+                    and torch.equal(reference['feats'], output['feats']))
+                result['logvar_bitwise_equal'] = torch.equal(reference['logvar'], output['logvar'])
         else:
             result['chunk_stats'] = getattr(model, 'last_chunk_stats', {})
             if args.kind == 'geometry':
@@ -236,6 +264,8 @@ def main():
                         [('rgb', slice(0, 3)), ('metallic', slice(3, 4)), ('roughness', slice(4, 5)), ('alpha', slice(5, 6))]}
     (args.folder / (name + '.json')).write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2), flush=True)
+    if args.require_exact and not (result['latent_bitwise_equal'] and result['logvar_bitwise_equal']):
+        raise AssertionError('Chunked encoder differs from the full reference; see comparison JSON')
 
 
 if __name__ == '__main__':

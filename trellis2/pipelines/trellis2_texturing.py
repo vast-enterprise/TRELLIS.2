@@ -184,6 +184,10 @@ class Trellis2TexturingPipeline(Pipeline):
         self,
         mesh: trimesh.Trimesh,
         resolution: int = 1024,
+        *,
+        chunk_size: Union[int, Literal['auto'], None] = None,
+        chunk_memory_mb: Optional[float] = None,
+        chunk_threshold_mb: float = 6144,
     ) -> SparseTensor:
         """
         Encode the meshes to structured latent.
@@ -191,6 +195,10 @@ class Trellis2TexturingPipeline(Pipeline):
         Args:
             mesh (trimesh.Trimesh): The mesh to encode.
             resolution (int): The resolution of mesh
+            chunk_size: 'auto' enables adaptive encoder workspaces; an integer
+                caps chunk rows. Requires eval and no_grad/inference_mode.
+            chunk_memory_mb: Optional estimated workspace budget in MiB.
+            chunk_threshold_mb: Estimated peak threshold for auto chunking.
         
         Returns:
             SparseTensor: The encoded structured latent.
@@ -216,7 +224,12 @@ class Trellis2TexturingPipeline(Pipeline):
             
         if self.low_vram:
             self.models['shape_slat_encoder'].to(self.device)
-        shape_slat = self.models['shape_slat_encoder'](vertices, intersected)
+        encode_options = (dict(chunk_size=chunk_size,
+                               chunk_memory_mb=chunk_memory_mb,
+                               chunk_threshold_mb=chunk_threshold_mb)
+                          if chunk_size is not None else {})
+        shape_slat = self.models['shape_slat_encoder'](
+            vertices, intersected, **encode_options)
         if self.low_vram:
             self.models['shape_slat_encoder'].cpu()
         return shape_slat
@@ -388,6 +401,9 @@ class Trellis2TexturingPipeline(Pipeline):
         decode_chunk_size: Union[int, Literal['auto'], None] = None,
         decode_chunk_memory_mb: Optional[float] = None,
         decode_chunk_threshold_mb: float = 6144,
+        encode_chunk_size: Union[int, Literal['auto'], None] = None,
+        encode_chunk_memory_mb: Optional[float] = None,
+        encode_chunk_threshold_mb: float = 6144,
     ) -> trimesh.Trimesh:
         """
         Run the pipeline.
@@ -398,13 +414,21 @@ class Trellis2TexturingPipeline(Pipeline):
             seed (int): The random seed.
             tex_slat_sampler_params (dict): Additional parameters for the texture latent sampler.
             preprocess_image (bool): Whether to preprocess the image.
+            encode_chunk_size: Optional 'auto' or integer chunk size for encoding.
+            encode_chunk_memory_mb: Optional encoder workspace budget in MiB.
+            encode_chunk_threshold_mb: Auto encoder peak estimate threshold in MiB.
         """
         if preprocess_image:
             image = self.preprocess_image(image)
         mesh = self.preprocess_mesh(mesh)
         torch.manual_seed(seed)
         cond = self.get_cond([image], 512) if resolution == 512 else self.get_cond([image], 1024)
-        shape_slat = self.encode_shape_slat(mesh, resolution)
+        shape_slat = self.encode_shape_slat(
+            mesh, resolution,
+            chunk_size=encode_chunk_size,
+            chunk_memory_mb=encode_chunk_memory_mb,
+            chunk_threshold_mb=encode_chunk_threshold_mb,
+        )
         tex_model = self.models['tex_slat_flow_model_512'] if resolution == 512 else self.models['tex_slat_flow_model_1024']
         tex_slat = self.sample_tex_slat(
             cond, tex_model,

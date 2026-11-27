@@ -23,6 +23,7 @@ class ChunkPolicy:
     max_points: int = 1_000_000
     memory_budget_bytes: int | None = None
     threshold_bytes: int | None = None
+    preserve_linear_shapes: bool = False
     stats: dict = field(default_factory=dict)
     plans: dict = field(default_factory=dict, repr=False)
 
@@ -67,12 +68,15 @@ def active_policy():
 
 
 @contextmanager
-def inference_chunks(max_points=1_000_000, memory_budget_mb=None, *, threshold_mb=None):
+def inference_chunks(max_points=1_000_000, memory_budget_mb=None, *, threshold_mb=None,
+                     preserve_linear_shapes=False):
     """Enable chunked operations inside no_grad/inference_mode; thread-local.
 
     ``max_points`` includes the convolution halo. ``memory_budget_mb`` sets
     the estimated temporary workspace budget; global input/output/model memory is
     additional. With None it adapts to free CUDA memory (20%, capped at 8 GiB).
+    ``preserve_linear_shapes`` keeps encoder GEMMs at their original row count:
+    cuBLAS can change precision/reduction order when the matrix shape changes.
     """
     if torch.is_grad_enabled():
         raise RuntimeError('Chunked inference requires torch.no_grad() or torch.inference_mode()')
@@ -84,9 +88,12 @@ def inference_chunks(max_points=1_000_000, memory_budget_mb=None, *, threshold_m
         raise ValueError('threshold_mb must be finite and positive')
     policy = ChunkPolicy(max_points,
                          None if memory_budget_mb is None else int(memory_budget_mb * 1024**2),
-                         None if threshold_mb is None else int(threshold_mb * 1024**2))
+                         None if threshold_mb is None else int(threshold_mb * 1024**2),
+                         preserve_linear_shapes=preserve_linear_shapes)
     if threshold_mb is not None:
         policy.stats.update(auto=True, auto_threshold_mib=threshold_mb)
+    if preserve_linear_shapes:
+        policy.stats['preserve_linear_shapes'] = True
     token = _ACTIVE.set(policy)
     try:
         yield policy

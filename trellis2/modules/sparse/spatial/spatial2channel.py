@@ -37,7 +37,25 @@ class SparseSpatial2Channel(nn.Module):
             new_coords, idx, subidx = cache
             
         new_feats = torch.zeros(new_coords.shape[0] * self.factor ** DIM, x.feats.shape[1], device=x.feats.device, dtype=x.feats.dtype)
-        new_feats[idx * self.factor ** DIM + subidx] = x.feats
+        from ..inference_chunk import active_policy
+        policy = active_policy()
+        if policy is not None:
+            if torch.is_grad_enabled():
+                raise RuntimeError('Chunked spatial rearrangement cannot run with gradients enabled')
+            rows = policy.rows(x.feats, x.feats.shape[1] * self.factor ** DIM)
+        else:
+            rows = max(1, len(x.feats))
+        if len(x.feats) <= rows:
+            new_feats[idx * self.factor ** DIM + subidx] = x.feats
+        else:
+            # Keep the global parent/child mapping and write disjoint slots.
+            # Children of the same parent may cross a chunk boundary: no sum
+            # or averaging is involved, so splitting them is exactly equivalent.
+            for start in range(0, len(x.feats), rows):
+                end = min(start + rows, len(x.feats))
+                target = idx[start:end] * self.factor ** DIM + subidx[start:end]
+                new_feats[target] = x.feats[start:end]
+                policy.record('spatial2channel', end - start)
 
         out = SparseTensor(new_feats.reshape(new_coords.shape[0], -1), new_coords, None if x._shape is None else torch.Size([x._shape[0], x._shape[1] * self.factor ** DIM]))
         out._scale = tuple([s * self.factor for s in x._scale])
