@@ -188,6 +188,7 @@ class Trellis2TexturingPipeline(Pipeline):
         chunk_size: Union[int, Literal['auto'], None] = None,
         chunk_memory_mb: Optional[float] = None,
         chunk_threshold_mb: float = 6144,
+        max_memory_gb: Optional[float] = None,
     ) -> SparseTensor:
         """
         Encode the meshes to structured latent.
@@ -226,8 +227,8 @@ class Trellis2TexturingPipeline(Pipeline):
             self.models['shape_slat_encoder'].to(self.device)
         encode_options = (dict(chunk_size=chunk_size,
                                chunk_memory_mb=chunk_memory_mb,
-                               chunk_threshold_mb=chunk_threshold_mb)
-                          if chunk_size is not None else {})
+                               chunk_threshold_mb=chunk_threshold_mb, max_memory_gb=max_memory_gb)
+                          if chunk_size is not None or max_memory_gb is not None else {})
         shape_slat = self.models['shape_slat_encoder'](
             vertices, intersected, **encode_options)
         if self.low_vram:
@@ -282,6 +283,7 @@ class Trellis2TexturingPipeline(Pipeline):
         slat: SparseTensor,
         *, chunk_size: Union[int, Literal['auto'], None] = None, chunk_memory_mb: Optional[float] = None,
         chunk_threshold_mb: float = 6144,
+        max_memory_gb: Optional[float] = None,
     ) -> SparseTensor:
         """
         Decode the structured latent.
@@ -296,7 +298,8 @@ class Trellis2TexturingPipeline(Pipeline):
             self.models['tex_slat_decoder'].to(self.device)
         ret = self.models['tex_slat_decoder'](slat,
             **(dict(chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
-                    chunk_threshold_mb=chunk_threshold_mb) if chunk_size is not None else {})) * 0.5 + 0.5
+                    chunk_threshold_mb=chunk_threshold_mb, max_memory_gb=max_memory_gb)
+               if chunk_size is not None or max_memory_gb is not None else {})) * 0.5 + 0.5
         if self.low_vram:
             self.models['tex_slat_decoder'].cpu()
         return ret
@@ -404,6 +407,7 @@ class Trellis2TexturingPipeline(Pipeline):
         encode_chunk_size: Union[int, Literal['auto'], None] = None,
         encode_chunk_memory_mb: Optional[float] = None,
         encode_chunk_threshold_mb: float = 6144,
+        max_memory_gb: Optional[float] = None,
     ) -> trimesh.Trimesh:
         """
         Run the pipeline.
@@ -428,6 +432,7 @@ class Trellis2TexturingPipeline(Pipeline):
             chunk_size=encode_chunk_size,
             chunk_memory_mb=encode_chunk_memory_mb,
             chunk_threshold_mb=encode_chunk_threshold_mb,
+            max_memory_gb=max_memory_gb,
         )
         tex_model = self.models['tex_slat_flow_model_512'] if resolution == 512 else self.models['tex_slat_flow_model_1024']
         tex_slat = self.sample_tex_slat(
@@ -436,8 +441,8 @@ class Trellis2TexturingPipeline(Pipeline):
         )
         options = (dict(chunk_size=decode_chunk_size,
                         chunk_memory_mb=decode_chunk_memory_mb,
-                        chunk_threshold_mb=decode_chunk_threshold_mb)
-                   if decode_chunk_size is not None else {})
+                        chunk_threshold_mb=decode_chunk_threshold_mb, max_memory_gb=max_memory_gb)
+                   if decode_chunk_size is not None or max_memory_gb is not None else {})
         pbr_voxel = self.decode_tex_slat(tex_slat, **options)
         out_mesh = self.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)
         return out_mesh

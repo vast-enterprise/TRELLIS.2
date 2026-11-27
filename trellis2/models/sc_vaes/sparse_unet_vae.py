@@ -398,7 +398,8 @@ class SparseUnetVaeEncoder(nn.Module):
     def forward(self, x: sp.SparseTensor, sample_posterior=False, return_raw=False, *,
                 chunk_size: Union[int, Literal['auto'], None] = None,
                 chunk_memory_mb: Optional[float] = None,
-                chunk_threshold_mb: float = 6144):
+                chunk_threshold_mb: float = 6144,
+                max_memory_gb: Optional[float] = None):
         """Encode with optional inference-time adaptive chunking.
 
         Chunking is applied to pointwise layers, stride-one convolutions and
@@ -410,8 +411,18 @@ class SparseUnetVaeEncoder(nn.Module):
         Compare deterministic latents with ``sample_posterior=False``; sampling
         requires the same RNG state. Floating-point kernels can round differently
         at different chunk sizes; bitwise equality is not guaranteed.
+        ``max_memory_gb=23`` enables a 23 GiB deployment budget, reserving
+        at least 1.5 GiB (or observed external CUDA usage plus 256 MiB).
+        Large intermediate features spill losslessly to CPU when needed. External
+        CUDA allocations can still grow; the cap enforces PyTorch allocations.
         """
         self.last_chunk_stats = {}
+        if max_memory_gb is not None:
+            from ...modules.sparse.bounded_vae import bounded_vae
+            return bounded_vae(self, x, max_memory_gb, 'encode',
+                               chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
+                               chunk_threshold_mb=chunk_threshold_mb,
+                               sample_posterior=sample_posterior, return_raw=return_raw)
         if chunk_size is not None:
             if self.training:
                 raise RuntimeError('Chunked encode requires model.eval()')
@@ -534,7 +545,8 @@ class SparseUnetVaeDecoder(nn.Module):
     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None,
                 return_subs: bool = False, *, chunk_size: Union[int, Literal['auto'], None] = None,
                 chunk_memory_mb: Optional[float] = None,
-                chunk_threshold_mb: float = 6144) -> sp.SparseTensor:
+                chunk_threshold_mb: float = 6144,
+                max_memory_gb: Optional[float] = None) -> sp.SparseTensor:
         """Decode with optional convolution halos and bounded workspaces.
 
         ``chunk_size='auto'`` counts actual voxels at every layer and skips
@@ -542,8 +554,16 @@ class SparseUnetVaeDecoder(nn.Module):
         An integer instead caps rows, including halos, regardless of threshold.
         Both modes require eval() and no_grad()/inference_mode(). Full tensors
         remain resident; the estimate is a heuristic, not an OOM guarantee.
+        ``max_memory_gb=23`` caps the allocator after reserving at least
+        1.5 GiB for external CUDA allocations, with host storage as fallback.
         """
         self.last_chunk_stats = {}
+        if max_memory_gb is not None:
+            from ...modules.sparse.bounded_vae import bounded_vae
+            return bounded_vae(self, x, max_memory_gb, 'decode',
+                               chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
+                               chunk_threshold_mb=chunk_threshold_mb,
+                               guide_subs=guide_subs, return_subs=return_subs)
         if chunk_size is not None:
             if self.training:
                 raise RuntimeError('Chunked decode requires model.eval()')

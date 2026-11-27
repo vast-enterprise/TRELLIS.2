@@ -1,4 +1,5 @@
 from typing import *
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,11 +45,14 @@ class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
         
     def forward(self, vertices: sp.SparseTensor, intersected: sp.SparseTensor,
                 sample_posterior=False, return_raw=False, **kwargs):
-        x = vertices.replace(torch.cat([
-            vertices.feats - 0.5,
-            intersected.feats.float() - 0.5,
-        ], dim=1))
-        return super().forward(x, sample_posterior, return_raw, **kwargs)
+        from ...modules.sparse.bounded_vae import cuda_budget
+        budget = kwargs.get('max_memory_gb')
+        with cuda_budget(self.device, budget) if budget is not None else nullcontext():
+            x = vertices.replace(torch.cat([
+                vertices.feats - 0.5,
+                intersected.feats.float() - 0.5,
+            ], dim=1))
+            return super().forward(x, sample_posterior, return_raw, **kwargs)
     
     
 class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
@@ -82,6 +86,14 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         self.resolution = resolution
         
     def forward(self, x: sp.SparseTensor, gt_intersected: sp.SparseTensor = None, **kwargs):
+        from ...modules.sparse.bounded_vae import cuda_budget
+        budget = kwargs.get('max_memory_gb')
+        # Include feature conversion and mesh extraction in the same allocator
+        # cap as the network. The nested base-model budget restores this cap.
+        with cuda_budget(self.device, budget) if budget is not None else nullcontext():
+            return self._forward_mesh(x, gt_intersected, **kwargs)
+
+    def _forward_mesh(self, x, gt_intersected=None, **kwargs):
         decoded = super().forward(x, **kwargs)
         if self.training:
             h, subs_gt, subs = decoded
@@ -105,7 +117,8 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
                 v.coords[:, 1:], v.feats, i.feats, q.feats,
                 aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
                 grid_size=self.resolution,
-                train=False
+                train=False,
+                chunk_size=1_000_000 if kwargs.get('max_memory_gb') is not None else None,
             )) for v, i, q in zip(vertices, intersected, quad_lerp)]
             out_list[0] = mesh
             return out_list[0] if len(out_list) == 1 else tuple(out_list)

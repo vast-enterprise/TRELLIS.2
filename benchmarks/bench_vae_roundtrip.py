@@ -8,8 +8,11 @@ texture uses explicit coordinate-aligned guidance rather than hidden caches.
 import argparse
 import gc
 import json
+import resource
 import sys
+import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -21,6 +24,29 @@ import o_voxel
 from trellis2 import models
 from trellis2.modules import sparse as sp
 from trellis2.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
+from trellis2.modules.sparse.bounded_vae import cuda_budget
+
+
+class DeviceMemorySampler:
+    """Sample NVML device usage, including allocations outside PyTorch.
+
+    Use an otherwise idle GPU. This is sampled usage, not an enforced limit.
+    """
+    def __enter__(self):
+        self.device = torch.cuda.current_device()
+        self.peak = torch.cuda.device_memory_used(self.device)
+        self.stopped = threading.Event()
+        def sample():
+            while not self.stopped.wait(.02):
+                self.peak = max(self.peak, torch.cuda.device_memory_used(self.device))
+        self.thread = threading.Thread(target=sample, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.peak = max(self.peak, torch.cuda.device_memory_used(self.device))
+        self.stopped.set()
+        self.thread.join()
 
 
 def order(coords):
@@ -117,22 +143,32 @@ def main():
     parser.add_argument('--models', type=Path, default=Path('/mnt/pfs/users/chenjiahao/TRELLIS2Plus/.hf_models/ckpts'))
     parser.add_argument('--chunk-size', type=lambda s: 'auto' if s == 'auto' else int(s))
     parser.add_argument('--chunk-memory-mb', type=float)
+    parser.add_argument('--max-memory-gb', type=float)
     parser.add_argument('--chunk-threshold-mb', type=float, default=6144)
     parser.add_argument('--context', choices=['inference', 'no_grad'], default='inference')
     parser.add_argument('--require-exact', action='store_true',
-                        help='Fail unless encode coordinates, latent and logvar are bitwise equal to full')
+                        help='Fail unless coordinates and encode/decode outputs are bitwise equal to full')
     parser.add_argument('--guidance', choices=['input', 'geometry'], default='input')
     parser.add_argument('--resolution', type=int, default=1024)
     parser.add_argument('--repeats', type=int, default=3, help='Warm up once, then time fresh-cache runs')
+    parser.add_argument('--warmup', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--mesh-input', type=Path, help='Saved geometry decoder fields for phase=mesh')
+    parser.add_argument('--geometry-guide', type=Path, help='Saved geometry subdivisions for --guidance geometry')
     args = parser.parse_args()
-    if args.require_exact and (args.phase != 'encode' or args.chunk_size is None):
-        parser.error('--require-exact needs --phase encode and --chunk-size')
-    if args.require_exact and not (args.folder / f'{args.kind}_encode_full.pt').exists():
-        parser.error('Run full encoding first to create the comparison reference')
+    if args.repeats < 1:
+        parser.error('--repeats must be positive')
+    if args.require_exact and args.chunk_size is None and args.max_memory_gb is None:
+        parser.error('--require-exact needs chunking or a memory budget')
+    reference_name = f'{args.kind}_{args.phase}_full'
+    if args.phase == 'decode' and args.kind == 'texture':
+        reference_name += '_' + args.guidance
+    if args.require_exact and not (args.folder / (reference_name + '.pt')).exists():
+        parser.error('Run the full phase first to create the comparison reference')
     torch.set_num_threads(4)
     phase = args.phase
-    label = 'auto' if args.chunk_size == 'auto' else ('chunked' if args.chunk_size else 'full')
-    name = args.kind + '_' + phase + ('_' + label if phase in ('encode', 'decode') else '')
+    label = ('auto' if args.chunk_size == 'auto' or (args.max_memory_gb is not None and args.chunk_size is None)
+             else ('chunked' if args.chunk_size else 'full'))
+    name = args.kind + '_' + phase + '_' + label
     if args.kind == 'texture' and phase == 'decode':
         name += '_' + args.guidance
     prefix = 'shape' if args.kind == 'geometry' else 'tex'
@@ -153,17 +189,18 @@ def main():
                 source, _ = read_input(args.folder / 'texture.vxz', 'texture')
                 guides = input_guides(source['coords'])
             else:
-                guide_path = args.folder / 'geometry_decode_chunked.pt'
+                guide_path = args.geometry_guide or args.folder / 'geometry_decode_chunked.pt'
                 guides = [sparse(p) for p in torch.load(guide_path, weights_only=True)['subs']]
             z = align_latent_to_guide(z, guides[0])
     else:
-        raw = torch.load(args.folder / 'geometry_decode_chunked.pt', weights_only=True)
+        raw = torch.load(args.mesh_input or args.folder / 'geometry_decode_chunked.pt', weights_only=True)
         h = sparse(raw)
     context = torch.inference_mode if args.context == 'inference' else torch.no_grad
     def run():
         if phase == 'encode':
             fresh = sp.SparseTensor(x.feats, x.coords)
             kwargs = dict(chunk_size=args.chunk_size, chunk_memory_mb=args.chunk_memory_mb,
+                          max_memory_gb=args.max_memory_gb,
                           chunk_threshold_mb=args.chunk_threshold_mb, return_raw=True,
                           sample_posterior=False)
             return (model(fresh, fresh.replace(flags.feats), **kwargs) if flags is not None
@@ -171,6 +208,7 @@ def main():
         elif phase == 'decode':
             fresh = sp.SparseTensor(z.feats, z.coords)
             kwargs = dict(chunk_size=args.chunk_size, chunk_memory_mb=args.chunk_memory_mb,
+                          max_memory_gb=args.max_memory_gb,
                           chunk_threshold_mb=args.chunk_threshold_mb)
             if args.kind == 'geometry':
                 # Raw network outputs allow numerical comparisons before the
@@ -179,26 +217,32 @@ def main():
             else:
                 return model(fresh, guide_subs=guides, **kwargs)
         else:
-            vertices = 2 * h.feats[:, :3].sigmoid() - .5
-            intersected = h.feats[:, 3:6] > 0
-            quad_lerp = torch.nn.functional.softplus(h.feats[:, 6:7])
-            return o_voxel.convert.flexible_dual_grid_to_mesh(
-                h.coords[:, 1:], vertices, intersected, quad_lerp,
-                aabb=[[-.5]*3, [.5]*3], grid_size=args.resolution, train=False)
+            with cuda_budget('cuda', args.max_memory_gb) if args.max_memory_gb is not None else nullcontext():
+                vertices = 2 * h.feats[:, :3].sigmoid() - .5
+                intersected = h.feats[:, 3:6] > 0
+                quad_lerp = torch.nn.functional.softplus(h.feats[:, 6:7])
+                rows = (1_000_000 if label == 'auto' else args.chunk_size)
+                return o_voxel.convert.flexible_dual_grid_to_mesh(
+                    h.coords[:, 1:], vertices, intersected, quad_lerp,
+                    aabb=[[-.5]*3, [.5]*3], grid_size=args.resolution, train=False,
+                    chunk_size=rows)
     with context():
-        warm = run()
-        del warm
-        times, peaks, reserved = [], [], []
+        if args.warmup:
+            warm = run()
+            del warm
+        times, peaks, reserved, device_peaks = [], [], [], []
         for rep in range(args.repeats):
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             baseline = torch.cuda.memory_allocated()
-            started = time.perf_counter()
-            value = run()
-            torch.cuda.synchronize()
-            times.append(time.perf_counter() - started)
+            with DeviceMemorySampler() as monitor:
+                started = time.perf_counter()
+                value = run()
+                torch.cuda.synchronize()
+                times.append(time.perf_counter() - started)
+            device_peaks.append(monitor.peak / 1024**3)
             peaks.append(torch.cuda.max_memory_allocated() / 1024**3)
             reserved.append(torch.cuda.max_memory_reserved() / 1024**3)
             if rep != args.repeats - 1:
@@ -213,25 +257,36 @@ def main():
               'seconds': seconds, 'baseline_cuda_gib': baseline / 1024**3,
               'peak_cuda_gib': max(peaks), 'seconds_runs': times,
               'peak_reserved_cuda_gib': max(reserved),
+              'peak_device_gib_sampled': max(device_peaks),
+              'process_peak_host_gib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2,
               'chunk_size': args.chunk_size, 'chunk_memory_mb': args.chunk_memory_mb,
+              'max_memory_gb': args.max_memory_gb,
+              'warmup': args.warmup,
               'chunk_threshold_mb': args.chunk_threshold_mb, 'resolution': args.resolution}
     if phase == 'mesh':
         result.update(vertices=len(mesh[0]), faces=len(mesh[1]), finite=bool(torch.isfinite(mesh[0]).all()))
-        torch.save({'vertices': mesh[0].cpu(), 'faces': mesh[1].cpu()}, args.folder / 'decoded_mesh.pt')
+        output = {'vertices': mesh[0].cpu(), 'faces': mesh[1].cpu()}
+        torch.save(output, args.folder / (name + '.pt'))
+        if args.chunk_size is None and args.max_memory_gb is None:
+            torch.save(output, args.folder / 'decoded_mesh.pt')
+        ref_path = args.folder / (reference_name + '.pt')
+        if label != 'full' and ref_path.exists():
+            reference = torch.load(ref_path, weights_only=True)
+            result['output_bitwise_equal'] = all(torch.equal(reference[k], output[k]) for k in output)
     else:
         result.update(output_rows=len(out.feats), finite=bool(torch.isfinite(out.feats).all()))
         output = pack(out)
         if phase == 'encode':
             # Keep the unchunked latent as the roundtrip baseline. Chunked
             # runs get separate artifacts and never overwrite the reference.
-            if args.chunk_size is None:
+            if args.chunk_size is None and args.max_memory_gb is None:
                 torch.save(output, args.folder / (args.kind + '_latent.pt'))
             output['logvar'] = logvar.float().cpu()
             torch.save(output, args.folder / (name + '.pt'))
             result['input_rows'] = len(x.feats)
             result['chunk_stats'] = getattr(model, 'last_chunk_stats', {})
             ref_path = args.folder / f'{args.kind}_encode_full.pt'
-            if args.chunk_size is not None and ref_path.exists():
+            if (args.chunk_size is not None or args.max_memory_gb is not None) and ref_path.exists():
                 reference = torch.load(ref_path, weights_only=True)
                 result['full_vs_chunked'] = compare(reference, output)
                 result['logvar_comparison'] = compare(
@@ -251,11 +306,16 @@ def main():
             if args.kind == 'texture':
                 ref_name += f'_{args.guidance}'
             ref_path = args.folder / f'{ref_name}.pt'
-            if args.chunk_size and ref_path.exists():
+            if (args.chunk_size is not None or args.max_memory_gb is not None) and ref_path.exists():
                 reference = torch.load(ref_path, weights_only=True)
                 result['full_vs_chunked'] = compare(reference, output)
+                result['output_bitwise_equal'] = (torch.equal(reference['coords'], output['coords'])
+                    and torch.equal(reference['feats'], output['feats']))
                 if args.kind == 'geometry':
                     result['subdivision_comparison'] = [compare(a, b) for a, b in zip(reference['subs'], output['subs'])]
+                    result['subdivision_bitwise_equal'] = (len(reference['subs']) == len(output['subs']) and all(
+                        torch.equal(a['coords'], b['coords']) and torch.equal(a['feats'], b['feats'])
+                        for a, b in zip(reference['subs'], output['subs'])))
             if args.kind == 'texture' and args.guidance == 'input':
                 result['reconstruction'] = compare(source, output)
                 if result['reconstruction']['coordinates_equal']:
@@ -264,8 +324,11 @@ def main():
                         [('rgb', slice(0, 3)), ('metallic', slice(3, 4)), ('roughness', slice(4, 5)), ('alpha', slice(5, 6))]}
     (args.folder / (name + '.json')).write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2), flush=True)
-    if args.require_exact and not (result['latent_bitwise_equal'] and result['logvar_bitwise_equal']):
-        raise AssertionError('Chunked encoder differs from the full reference; see comparison JSON')
+    if args.require_exact:
+        exact = (result['latent_bitwise_equal'] and result['logvar_bitwise_equal'] if phase == 'encode'
+                 else result['output_bitwise_equal'] and result.get('subdivision_bitwise_equal', True))
+        if not exact:
+            raise AssertionError('Budgeted/chunked output differs from the full reference; see comparison JSON')
 
 
 if __name__ == '__main__':

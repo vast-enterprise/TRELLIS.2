@@ -166,6 +166,7 @@ def flexible_dual_grid_to_mesh(
     voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor] = None,
     grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
     train: bool = False,
+    chunk_size: Optional[int] = None,
 ):
     """
     Extract mesh from sparse voxel structures using flexible dual grid.
@@ -181,6 +182,9 @@ def flexible_dual_grid_to_mesh(
         grid_size (int, list, tuple, np.ndarray, torch.Tensor): The size of the grid.
             NOTE: One of voxel_size and grid_size must be provided.
         train (bool): Whether to use training mode.
+        chunk_size (int): Optional inference-only core voxel count. Uses the
+            global voxel hash for neighbors and stages faces on CPU. Requires
+            split_weight; preserves vertex/face order and diagonal decisions.
         
     Returns:
         vertices (torch.Tensor): The vertices of the mesh.
@@ -234,6 +238,16 @@ def flexible_dual_grid_to_mesh(
     assert isinstance(grid_size, torch.Tensor), f"grid_size must be an int, list, tuple, np.ndarray, or torch.Tensor, but got {type(grid_size)}"
     assert grid_size.dim() == 1, f"grid_size must be a 1D tensor, but got {grid_size.shape}"
     assert grid_size.size(0) == 3, f"grid_size must have 3 elements, but got {grid_size.size(0)}"
+
+    if chunk_size is not None:
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer')
+        if train or torch.is_grad_enabled():
+            raise RuntimeError('Chunked mesh extraction requires inference_mode or no_grad and train=False')
+        if split_weight is None:
+            raise ValueError('Chunked mesh extraction requires split_weight')
+        return _chunked_dual_grid_mesh(coords, dual_vertices, intersected_flag,
+                                      split_weight, aabb, voxel_size, grid_size, chunk_size)
 
     # Extract mesh
     N = dual_vertices.shape[0]
@@ -299,3 +313,41 @@ def flexible_dual_grid_to_mesh(
         mesh_triangles = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_train].reshape(-1, 3)
     
     return mesh_vertices, mesh_triangles
+
+
+def _chunked_dual_grid_mesh(coords, dual_vertices, intersected_flag, split_weight,
+                           aabb, voxel_size, grid_size, chunk_size):
+    """Batch queries against a global hash; never cut connectivity at a tile edge."""
+    count = len(coords)
+    dtype = torch.promote_types(torch.float32, dual_vertices.dtype)
+    vertices = torch.empty((count, 3), dtype=dtype, device=coords.device)
+    if count == 0:
+        return vertices, torch.empty((0, 3), dtype=torch.int32, device=coords.device)
+    hashmap = _init_hashmap(grid_size, 2 * count, device=coords.device)
+    keys = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1)
+    _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap, keys, *grid_size.tolist())
+    del keys
+    offsets = flexible_dual_grid_to_mesh.edge_neighbor_voxel_offset.to(coords.device)
+    split1 = flexible_dual_grid_to_mesh.quad_split_1.to(coords.device)
+    split2 = flexible_dual_grid_to_mesh.quad_split_2.to(coords.device)
+    faces = []
+    for start in range(0, count, chunk_size):
+        end = min(start + chunk_size, count)
+        core = coords[start:end]
+        vertices[start:end] = (core.float() + dual_vertices[start:end]) * voxel_size + aabb[0].reshape(1, 3)
+        neighbors = (core.reshape(-1, 1, 1, 3) + offsets)[intersected_flag[start:end]]
+        if neighbors.numel() == 0:
+            continue
+        keys = torch.cat([torch.zeros((neighbors.numel() // 3, 1), dtype=coords.dtype,
+                                     device=coords.device), neighbors.reshape(-1, 3)], dim=1)
+        indices = _C.hashmap_lookup_3d_cuda(*hashmap, keys, *grid_size.tolist()).reshape(-1, 4).int()
+        quads = indices[(indices != 0xffffffff).all(dim=1)]
+        weights = split_weight[quads]
+        triangles = torch.where(weights[:, 0] * weights[:, 2] > weights[:, 1] * weights[:, 3],
+                                quads[:, split1], quads[:, split2]).reshape(-1, 3)
+        faces.append(triangles.cpu())
+        del neighbors, keys, indices, quads, weights, triangles
+    del hashmap
+    triangles = (torch.cat(faces, dim=0).to(coords.device) if faces else
+                 torch.empty((0, 3), dtype=torch.int32, device=coords.device))
+    return vertices, triangles

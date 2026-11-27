@@ -369,6 +369,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         resolution: int,
         *, chunk_size: Union[int, Literal['auto'], None] = None, chunk_memory_mb: Optional[float] = None,
         chunk_threshold_mb: float = 6144,
+        max_memory_gb: Optional[float] = None,
     ) -> Tuple[List[Mesh], List[SparseTensor]]:
         """
         Decode the structured latent.
@@ -386,7 +387,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self.models['shape_slat_decoder'].low_vram = True
         ret = self.models['shape_slat_decoder'](slat, return_subs=True,
             **(dict(chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
-                    chunk_threshold_mb=chunk_threshold_mb) if chunk_size is not None else {}))
+                    chunk_threshold_mb=chunk_threshold_mb, max_memory_gb=max_memory_gb)
+               if chunk_size is not None or max_memory_gb is not None else {}))
         if self.low_vram:
             self.models['shape_slat_decoder'].cpu()
             self.models['shape_slat_decoder'].low_vram = False
@@ -441,6 +443,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         subs: List[SparseTensor],
         *, chunk_size: Union[int, Literal['auto'], None] = None, chunk_memory_mb: Optional[float] = None,
         chunk_threshold_mb: float = 6144,
+        max_memory_gb: Optional[float] = None,
     ) -> SparseTensor:
         """
         Decode the structured latent.
@@ -455,7 +458,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self.models['tex_slat_decoder'].to(self.device)
         ret = self.models['tex_slat_decoder'](slat, guide_subs=subs,
             **(dict(chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
-                    chunk_threshold_mb=chunk_threshold_mb) if chunk_size is not None else {})) * 0.5 + 0.5
+                    chunk_threshold_mb=chunk_threshold_mb, max_memory_gb=max_memory_gb)
+               if chunk_size is not None or max_memory_gb is not None else {})) * 0.5 + 0.5
         if self.low_vram:
             self.models['tex_slat_decoder'].cpu()
         return ret
@@ -468,6 +472,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         resolution: int,
         *, chunk_size: Union[int, Literal['auto'], None] = None, chunk_memory_mb: Optional[float] = None,
         chunk_threshold_mb: float = 6144,
+        max_memory_gb: Optional[float] = None,
     ) -> List[MeshWithVoxel]:
         """
         Decode the latent codes.
@@ -478,8 +483,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             resolution (int): The resolution of the output.
         """
         options = (dict(chunk_size=chunk_size, chunk_memory_mb=chunk_memory_mb,
-                        chunk_threshold_mb=chunk_threshold_mb)
-                   if chunk_size is not None else {})
+                        chunk_threshold_mb=chunk_threshold_mb, max_memory_gb=max_memory_gb)
+                   if chunk_size is not None or max_memory_gb is not None else {})
         meshes, subs = self.decode_shape_slat(shape_slat, resolution, **options)
         tex_voxels = self.decode_tex_slat(tex_slat, subs, **options)
         out_mesh = []
@@ -514,6 +519,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         decode_chunk_size: Union[int, Literal['auto'], None] = None,
         decode_chunk_memory_mb: Optional[float] = None,
         decode_chunk_threshold_mb: float = 6144,
+        max_memory_gb: Optional[float] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -608,8 +614,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         torch.cuda.empty_cache()
         decode_options = (dict(chunk_size=decode_chunk_size,
                                chunk_memory_mb=decode_chunk_memory_mb,
-                               chunk_threshold_mb=decode_chunk_threshold_mb)
-                          if decode_chunk_size is not None else {})
+                               chunk_threshold_mb=decode_chunk_threshold_mb, max_memory_gb=max_memory_gb)
+                          if decode_chunk_size is not None or max_memory_gb is not None else {})
         out_mesh = self.decode_latent(shape_slat, tex_slat, res, **decode_options)
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
